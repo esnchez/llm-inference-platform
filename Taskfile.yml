@@ -1,0 +1,98 @@
+# Task runner: https://taskfile.dev  (`task --list` shows every task)
+version: "3"
+
+vars:
+  # Go module root: all source code lives here.
+  PLATFORM_DIR: platform
+  # Oldest Go version supported (go.mod). The race tests run against it.
+  GO_IMAGE: golang:1.23
+  # How many times the race tests repeat, to shake out flaky interleavings.
+  RACE_COUNT: 5
+  COVER_FILE: coverage.out
+
+tasks:
+  default:
+    desc: Run the full local test suite (same as `task check`)
+    cmds:
+      - task: check
+
+  # ---- run / build ----
+
+  run:
+    desc: "Run the control plane with simulated workers (extra flags: task run -- -workers 5)"
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - go run ./cmd/platform {{.CLI_ARGS}}
+
+  loadgen:
+    desc: "Send realistic load to a running platform (extra flags: task loadgen -- -rate 50 -duration 30s)"
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - go run ./cmd/loadgen {{.CLI_ARGS}}
+
+  build:
+    desc: Build the platform and loadgen binaries into platform/bin/
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - go build -o bin/platform{{exeExt}} ./cmd/platform
+      - go build -o bin/loadgen{{exeExt}} ./cmd/loadgen
+
+  # ---- testing suite ----
+
+  fmt:
+    desc: Format the code with gofmt
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - gofmt -w .
+
+  fmt:check:
+    desc: Fail if any file is not gofmt-formatted
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - cmd: test -z "$(gofmt -l .)" || (echo "Files not formatted:" && gofmt -l . && exit 1)
+        silent: true
+
+  vet:
+    desc: Static analysis with go vet
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Unit and HTTP tests (worker leases, pool routing, SSE API)
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - go test -count=1 ./...
+
+  test:race:
+    desc: Race-detector tests in a Linux container (needs Docker; no gcc required)
+    cmds:
+      - docker run --rm -v "{{.ROOT_DIR}}/{{.PLATFORM_DIR}}:/src" -w /src {{.GO_IMAGE}} go test -race -count={{.RACE_COUNT}} ./...
+
+  test:race:local:
+    desc: Race-detector tests on the host (needs cgo, i.e. gcc on Windows)
+    dir: "{{.PLATFORM_DIR}}"
+    env:
+      CGO_ENABLED: "1"
+    cmds:
+      - go test -race -count={{.RACE_COUNT}} ./...
+
+  test:cover:
+    desc: Tests with a coverage report per function
+    dir: "{{.PLATFORM_DIR}}"
+    cmds:
+      - go test -count=1 -coverprofile={{.COVER_FILE}} ./...
+      - go tool cover -func={{.COVER_FILE}}
+
+  check:
+    desc: "Local suite: fmt:check, vet, test"
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: test
+
+  check:all:
+    desc: "Full suite: check + race tests in Docker"
+    cmds:
+      - task: check
+      - task: test:race
