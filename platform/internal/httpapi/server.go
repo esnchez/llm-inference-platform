@@ -201,12 +201,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// a proper HTTP status code.
 	lease, err := s.sched.Acquire(r.Context(), req)
 	if err != nil {
-		s.writeAdmissionError(w, r, err)
+		s.writeAdmissionError(w, r.Context(), err)
 		log.Info("request rejected", "error", err)
 		return
 	}
 	defer lease.Release()
-	log = log.With("worker_id", lease.WorkerID())
 
 	// ctx is cancelled when the client disconnects or when we fail to write
 	// to it; the worker sees it and frees its capacity.
@@ -220,7 +219,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		res = s.collect(ctx, w, req, lease)
 	}
 
-	attrs := []any{"completion_tokens", res.completionTokens, "duration_ms", s.now().Sub(start).Milliseconds()}
+	// After the stream: a retry may have moved the request to another worker.
+	attrs := []any{"worker_id", lease.WorkerID(), "completion_tokens", res.completionTokens, "duration_ms", s.now().Sub(start).Milliseconds()}
 	if !res.firstToken.IsZero() {
 		attrs = append(attrs, "ttft_ms", res.firstToken.Sub(start).Milliseconds())
 	}
@@ -243,14 +243,25 @@ type streamResult struct {
 func (s *Server) stream(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter,
 	req inference.InferenceRequest, lease inference.Lease, includeUsage bool) streamResult {
 	rc := http.NewResponseController(w)
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
-	h.Set("X-Request-Id", req.ID)
-	h.Set("X-Worker-Id", lease.WorkerID())
-	w.WriteHeader(http.StatusOK)
+	// The 200 and the SSE headers wait for the first chunk (Phase 4,
+	// decision 4): until then the scheduler may still retry the request on
+	// another worker, and a failure can still get a proper status code
+	// (README §9, FI-9).
+	started := false
+	startResponse := func() {
+		if started {
+			return
+		}
+		started = true
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		h.Set("X-Accel-Buffering", "no")
+		h.Set("X-Request-Id", req.ID)
+		h.Set("X-Worker-Id", lease.WorkerID())
+		w.WriteHeader(http.StatusOK)
+	}
 
 	var res streamResult
 	writeFailed := false
@@ -258,6 +269,7 @@ func (s *Server) stream(ctx context.Context, cancel context.CancelFunc, w http.R
 		if writeFailed {
 			return
 		}
+		startResponse()
 		if err := writeSSE(w, rc, v); err != nil {
 			// The client is gone: stop the worker and keep draining.
 			writeFailed = true
@@ -284,6 +296,12 @@ func (s *Server) stream(ctx context.Context, cancel context.CancelFunc, w http.R
 	res.err = wait()
 	if res.err == nil && writeFailed {
 		res.err = context.Canceled
+	}
+	if res.err != nil && !started {
+		// Failed before the first token, retries included: nothing was
+		// sent, so answer with a real status code.
+		s.writeAdmissionError(w, ctx, res.err)
+		return res
 	}
 
 	switch {
@@ -324,9 +342,7 @@ func (s *Server) collect(ctx context.Context, w http.ResponseWriter,
 	}
 	res.err = wait()
 	if res.err != nil {
-		if ctx.Err() == nil {
-			writeError(w, http.StatusInternalServerError, "server_error", "", res.err.Error())
-		}
+		s.writeAdmissionError(w, ctx, res.err)
 		return res
 	}
 	w.Header().Set("X-Worker-Id", lease.WorkerID())
@@ -385,9 +401,12 @@ func renderPrompt(msgs []chatMessage) string {
 	return b.String()
 }
 
-func (s *Server) writeAdmissionError(w http.ResponseWriter, r *http.Request, err error) {
+// writeAdmissionError answers a request that failed before any byte of
+// the response was written: at admission, or in the stream before its
+// first token.
+func (s *Server) writeAdmissionError(w http.ResponseWriter, ctx context.Context, err error) {
 	switch {
-	case r.Context().Err() != nil:
+	case ctx.Err() != nil:
 		// Client already gone; nothing useful to write.
 	case errors.Is(err, inference.ErrModelNotFound):
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
@@ -404,6 +423,12 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, inference.ErrAtCapacity):
 		s.setRetryAfter(w, err)
 		writeError(w, http.StatusServiceUnavailable, "server_overloaded", "at_capacity", "no worker has free capacity, retry later")
+	case errors.Is(err, inference.ErrNoHealthyWorkers):
+		s.setRetryAfter(w, err)
+		writeError(w, http.StatusServiceUnavailable, "server_error", "no_healthy_workers", "no healthy worker serves this model right now, retry later")
+	case errors.Is(err, inference.ErrWorkerFailure):
+		s.setRetryAfter(w, err)
+		writeError(w, http.StatusServiceUnavailable, "server_error", "worker_unavailable", err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "server_error", "", err.Error())
 	}

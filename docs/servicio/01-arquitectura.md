@@ -42,14 +42,14 @@ Todo el código vive en `platform/`, el módulo Go `llm-inference-platform`:
 ```text
 platform/
 ├── go.mod
-├── cmd/platform/          wiring: flags, creación de workers, servidor HTTP, apagado ordenado
+├── cmd/platform/          wiring: flags, creación de workers, servidor HTTP, apagado ordenado, /debug de administración
 ├── cmd/loadgen/           generador de carga contra un servidor en marcha (solo HTTP)
 └── internal/
     ├── inference/         contrato core (sin dependencias internas)
     ├── tokens/            estimación de tokens
     ├── prefix/            hashes de prefijo por bloque y radix tree de prefijos (Fase 3)
-    ├── simworker/         implementación simulada de Worker/Lease
-    ├── scheduler/         admisión (colas, dispatcher) y colocación (Placement: round-robin o afinidad de prefijo)
+    ├── simworker/         implementación simulada de Worker/Lease, con fallos inyectables
+    ├── scheduler/         admisión, colocación, registro de workers, salud, breaker y reintentos
     └── httpapi/           API HTTP OpenAI-compatible, SSE
 ```
 
@@ -77,10 +77,10 @@ Define los tipos que cruzan la frontera control/data plane:
 | :--- | :--- |
 | `InferenceRequest` | Unidad de trabajo: `ID`, `Model`, `Prompt`, `PromptTokens` (estimados), `MaxNewTokens` y, desde la Fase 3, `PrefixHashes` (hashes encadenados de los bloques del prompt; opcional). `TokenCost()` = `PromptTokens + MaxNewTokens`. |
 | `TokenChunk` | Un trozo de salida: `Index`, `Text`, `FinishReason` (solo en el último). |
-| `Worker` | `ID`, `Models`, `AcquireLease`, `Snapshot` y, desde la Fase 2, `CapacityChanged` (señal agrupada de capacidad liberada). |
+| `Worker` | `ID`, `Models`, `AcquireLease`, `Snapshot`, `CapacityChanged` (Fase 2, señal agrupada de capacidad liberada) y `Health` (Fase 4, devuelve un `HealthStatus` con el `InstanceID` del proceso). |
 | `Lease` | `WorkerID`, `ExecuteStream`, `Release`. |
 | `WorkerSnapshot` | Vista informativa del estado de un worker (presupuesto, reservado, leases y, si tiene caché de prefijos, su tamaño y sus aciertos). |
-| Errores | `ErrAtCapacity`, `ErrRequestTooLarge`, `ErrModelNotServed`, `ErrModelNotFound`, `ErrInvalidRequest`, `ErrLeaseUsed`, `ErrLeaseReleased`, `ErrLeaseExpired`, `ErrQueueFull`, `ErrQueueTimeout`. |
+| Errores | `ErrAtCapacity`, `ErrRequestTooLarge`, `ErrModelNotServed`, `ErrModelNotFound`, `ErrInvalidRequest`, `ErrLeaseUsed`, `ErrLeaseReleased`, `ErrLeaseExpired`, `ErrQueueFull`, `ErrQueueTimeout` y, desde la Fase 4, `ErrWorkerFailure` (fallo del propio worker, no de la petición) y `ErrNoHealthyWorkers`. |
 | `RetryAfterError` | Envuelve un error de cola con el `Retry-After` que calcula el scheduler; se lee con `errors.As`. |
 | `StartStream` | Helper que ejecuta `ExecuteStream` en una goroutine y devuelve un canal que se cierra al terminar más una función `wait()` con el error. |
 
@@ -103,7 +103,7 @@ No depende del scheduler ni de los workers (solo de `tokens`), así que se prueb
 
 Implementa `Worker` y `Lease` con un presupuesto de tokens protegido por un mutex y un generador de tokens con latencias artificiales. Desde la Fase 3 tiene además una caché de prefijos simulada que acorta el TTFT. Ver [04 · Worker simulado](04-worker-simulado.md).
 
-### `internal/scheduler` — admisión y colocación (Fases 2 y 3)
+### `internal/scheduler` — admisión, colocación y ciclo de vida (Fases 2 a 4)
 
 Desde la Fase 2 el scheduler tiene dos mitades detrás de la misma `Acquire` ([08 · Decisión 3](08-fase-2-decisiones.md#decisión-3-separar-admisión-y-colocación)):
 
@@ -140,6 +140,26 @@ Los rechazos por cola van envueltos en `inference.RetryAfterError`, con un `Retr
 
 `Stats()` expone el estado de las colas en `GET /debug/scheduler` (y, con `PrefixAffinity`, sus contadores bajo `placement`); `Models()` y `Snapshots()` agregan la información de los workers para `/v1/models` y `/debug/workers`. `Close()` para el dispatcher.
 
+#### Ciclo de vida de los workers (Fase 4)
+
+Desde la Fase 4 el scheduler es también el **registro de workers** ([10](10-fase-4-decisiones.md)):
+
+| Pieza | Fichero | Qué hace |
+| :--- | :--- | :--- |
+| Registro | `registry.go` | `AddWorker` / `RemoveWorker` en caliente. La baja **drena**: el worker deja de recibir peticiones y desaparece (también del radix tree) cuando termina su último stream. Los límites por modelo y la escucha del dispatcher se recalculan en cada cambio. |
+| Salud | `registry.go` | Una goroutine por worker llama a `Health` cada 2 s (3 fallos seguidos → no sano; 2 éxitos → sano). Un `InstanceID` distinto significa que el worker se reinició: se olvidan sus prefijos. |
+| *Circuit breaker* | `registry.go` | Por worker. Lo abren 5 fallos del worker seguidos o un healthcheck no sano. Tras 10 s (doble en cada reapertura, máximo 2 min) deja pasar **una** petición de prueba; si sale bien, se cierra. |
+| Degradado | `registry.go` | Un worker con una ITL más de 2× la mediana de los demás solo se ofrece a la colocación si los otros no tienen sitio. |
+| Lease gestionado | `lease.go` | El `Lease` que devuelve `Acquire` envuelve el del worker: mide la ITL, informa al breaker de cómo acabó cada stream, corta los cuelgues (sin primer token en 10 s + 1 ms por token de prompt, o sin token nuevo en 10 s) y, si el worker falla **antes del primer token**, reintenta una vez en otro worker. |
+
+La colocación solo ve workers usables: activos, sanos y con el breaker cerrado (o semiabierto sin prueba en curso). Si un modelo tiene workers pero ninguno usable, `Acquire` devuelve `ErrNoHealthyWorkers` (`503`) sin encolar: la cola es para esperar capacidad, no recuperación.
+
+| Situación (Fase 4) | Error | HTTP |
+| :--- | :--- | :--- |
+| Ningún worker usable del modelo | `ErrNoHealthyWorkers` | 503 `no_healthy_workers` |
+| El worker falla antes del primer token, también tras el reintento | `ErrWorkerFailure` | 503 `worker_unavailable` |
+| El worker falla a mitad de stream | `ErrWorkerFailure` | error en banda (el `200` ya se envió) |
+
 El scheduler asume **una sola réplica del control plane** (decisión registrada en **FI-2**).
 
 ### `internal/httpapi` — la API
@@ -153,6 +173,8 @@ Traduce HTTP ⇄ contrato `inference`: valida el JSON, construye el `InferenceRe
 3. Crea la colocación elegida con `-placement`, un `scheduler.Scheduler` (que arranca su dispatcher) y el `httpapi.Server`; al salir, `Close()` para el dispatcher.
 4. Arranca `http.Server` con `ReadHeaderTimeout: 10s` y **sin `WriteTimeout`** (un `WriteTimeout` cortaría cualquier stream SSE largo).
 5. Al recibir `SIGINT`/`SIGTERM` llama a `Shutdown` con `-shutdown-grace`: deja de aceptar conexiones y espera a que terminen los streams en curso. Si se agota la gracia, `Close()` corta las conexiones restantes; eso cancela sus contextos y, por tanto, libera sus leases.
+
+Además de las rutas de `httpapi`, `cmd/platform` sirve los endpoints de administración de los workers simulados (`admin.go`): `POST /debug/workers` (alta), `DELETE /debug/workers/{id}` (baja con drenaje), `POST /debug/workers/{id}/faults` (inyectar fallos) y `POST /debug/workers/{id}/restart`. Ver [05](05-api-http.md#administración-de-workers-simulados-fase-4).
 
 Logs: JSON estructurado (`log/slog`) a stdout.
 
@@ -177,6 +199,12 @@ Logs: JSON estructurado (`log/slog`) a stdout.
 | `-affinity-max-load` | `0.8` | Carga del ledger a partir de la cual un worker deja de recibir peticiones solo por afinidad. |
 | `-affinity-min-blocks` | `4` | Prefijo cacheado mínimo que cuenta como afinidad, en bloques de 16 tokens. |
 | `-prefix-cache-blocks` | `-1` (= `token-budget/16`) | Caché de prefijos simulada por worker, en bloques; `0` la desactiva. |
+| `-health-interval` | `2s` | Frecuencia de los healthchecks; negativo los desactiva. |
+| `-breaker-failures` | `5` | Fallos del worker seguidos que abren su breaker. |
+| `-breaker-cooldown` | `10s` | Espera en abierto antes de la petición de prueba (doble en cada reapertura, máximo 2 min). |
+| `-ttft-timeout` | `10s` | Sin primer token en este tiempo (+1 ms por token de prompt): worker colgado. |
+| `-stall-timeout` | `10s` | Sin token nuevo en este tiempo a mitad de stream: worker colgado. |
+| `-max-retries` | `1` | Reintentos en otro worker si uno falla antes del primer token; `-1` los desactiva. |
 | `-shutdown-grace` | `15s` | Gracia para los streams en curso al apagar. |
 
 ## Cómo se separará en procesos más adelante
@@ -184,7 +212,8 @@ Logs: JSON estructurado (`log/slog`) a stdout.
 | Hoy (en memoria) | Futuro |
 | :--- | :--- |
 | `simworker.Worker` en el mismo proceso | Pod de vLLM con GPU; `VLLMAdapter` en el control plane habla con él por HTTP (Fase 6). |
-| Lista fija de workers creada en `main` | *Worker Registry* con heartbeats y health checks (Fase 4). |
+| Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el *watch* de los Endpoints de Kubernetes (Fase 7). |
+| Healthchecks contra `simworker.Health` | `GET /health` de vLLM desde el `VLLMAdapter` (Fase 6). |
 | `PrefixAffinity` aproxima las cachés con su propio árbol LRU (Fase 3) | Corregirlo con eventos de KV-Cache de vLLM, si la versión fijada los publica (Fase 6). |
 | Caché de prefijos simulada en `simworker` | *Automatic prefix caching* de vLLM; `PrefixHashes` deja de usarse en el worker. |
 | Una réplica | Varias réplicas: ver **FI-2**. |

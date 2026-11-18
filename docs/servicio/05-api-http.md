@@ -20,6 +20,8 @@ Solo se implementa el subconjunto que el control plane necesita hoy.
 | `GET /debug/scheduler` | Estado de la admisión: peticiones y tokens en cola por modelo, límite de la cola, edad de la cabeza, admitidas (directas y desde la cola), rechazos por motivo, despertares con barrera y tiempo en cola p50/p99. Con `-placement prefix`, un bloque `placement` con los contadores de afinidad y el tamaño del radix tree ([09 · Métricas](09-fase-3-routing-por-prefijos.md#métricas)). |
 | `GET /healthz` | `200 ok` (liveness). |
 
+`/debug/workers` incluye desde la Fase 4 un objeto `status` por worker: `state` (`active`/`draining`), `healthy`, `breaker` (`closed`/`open`/`half-open`), `degraded`, `itl_ms`, `in_flight`, `failures`, `breaker_opens` e `instance_id`. `/debug/scheduler` añade `worker_failures`, `ttft_timeouts`, `stall_timeouts`, `retries`, `retry_successes`, `breaker_opens`, `restarts_detected` y `rejected_no_healthy_workers`.
+
 Las rutas usan los patrones con método de `net/http` (Go ≥ 1.22): un `GET` a `/v1/chat/completions` devuelve `405` automáticamente.
 
 ## Petición
@@ -49,6 +51,8 @@ Campos aceptados por OpenAI pero **ignorados** hoy: `temperature`, `top_p`, `sto
 
 ## Respuesta en streaming (SSE)
 
+El `200` y las cabeceras SSE se envían **con el primer token**, no al admitir la petición (Fase 4). Si el worker falla antes, la petición se reintenta en otro sin que el cliente lo note; si no hay alternativa, el cliente recibe un error normal (`503 worker_unavailable` con `Retry-After`) en lugar de un stream roto.
+
 ```text
 data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":1794154380,"model":"sim-llama-3-8b","choices":[{"index":0,"delta":{"role":"assistant","content":"token"},"finish_reason":null}]}
 
@@ -69,7 +73,7 @@ data: [DONE]
 
 ### Errores a mitad de stream
 
-Con el `200` ya enviado, un fallo del worker se notifica dentro del stream, como hacen los servidores OpenAI-compatibles, seguido de `[DONE]`:
+Con el `200` ya enviado (es decir, después del primer token), un fallo del worker se notifica dentro del stream y no se reintenta, como hacen los servidores OpenAI-compatibles, seguido de `[DONE]`:
 
 ```text
 data: {"error":{"message":"…","type":"server_error"}}
@@ -111,11 +115,24 @@ Salvo el `405`, todos usan el formato de OpenAI:
 | `503` | `server_overloaded` / `queue_full` + `Retry-After` | La cola del modelo está llena (límite por tokens) o se alcanzó el tope global de peticiones en espera. |
 | `503` | `server_overloaded` / `queue_timeout` + `Retry-After` | La petición esperó en la cola el máximo (5 s o el deadline del cliente) sin que se liberase capacidad. |
 | `503` | `server_overloaded` / `at_capacity` + `Retry-After` | Se mantiene en el mapa, pero el scheduler de la Fase 2 ya no lo devuelve. |
-| `500` | `server_error` | Error inesperado del worker (en la variante no-streaming). |
+| `503` | `server_error` / `no_healthy_workers` + `Retry-After` | Hay workers que sirven el modelo, pero ninguno está sano ni con el breaker cerrado (Fase 4). No se encola. |
+| `503` | `server_error` / `worker_unavailable` + `Retry-After` | El worker falló antes del primer token y el reintento también falló o no había otro worker (Fase 4). |
+| `500` | `server_error` | Error inesperado antes del primer token. |
 
 **`503` frente a `400`:** `503` significa "ahora no, reintenta" y `400` "nunca". La diferencia está en el scheduler: `ErrRequestTooLarge` solo se devuelve si la petición no cabe en ninguno de los workers del modelo ni vacíos; si cabe pero ahora no hay hueco, espera en la cola y solo recibe `503` si la cola está llena o no entra a tiempo.
 
 **`Retry-After`:** lo calcula el scheduler a partir de la espera reciente en cola (media exponencial), acotada entre 1 s y 30 s, más hasta 1 s de *jitter* para que los clientes no reintenten sincronizados. Llega en un `inference.RetryAfterError`; `Config.RetryAfter` (1 s) solo se usa si el error no trae valor.
+
+## Administración de workers simulados (Fase 4)
+
+Los sirve `cmd/platform` (no `httpapi`), porque crean y rompen workers **simulados**:
+
+| Método y ruta | Efecto | Respuesta |
+| :--- | :--- | :--- |
+| `POST /debug/workers` | Crea y registra un worker nuevo (`sim-worker-N`) con la configuración de los flags. | `201 {"worker_id": …}` |
+| `DELETE /debug/workers/{id}` | Baja con drenaje: no recibe más peticiones y desaparece de `/debug/workers` cuando termina su último stream. | `202 {"state": "draining"}`; `404` si no existe |
+| `POST /debug/workers/{id}/faults` | Sustituye sus fallos inyectados por el cuerpo JSON (campos de [04 · Fallos simulados](04-worker-simulado.md#fallos-simulados-fase-4)); `{}` los quita. Campos desconocidos → `400`. | `200` con los fallos vigentes |
+| `POST /debug/workers/{id}/restart` | Simula un reinicio: corta sus streams, vacía su caché y cambia su `InstanceID`. | `200` |
 
 ## Configuración (`httpapi.Config`)
 
@@ -152,6 +169,12 @@ task loadgen -- -rate 30 -duration 10s
 # Routing por prefijos: 24 system prompts compartidos (añadir -prefix-skew 1.5 para unos pocos calientes).
 # Comparar con el servidor arrancado con -placement prefix y con -placement round-robin.
 task loadgen -- -rate 4 -duration 60s -prefixes 24 -rag-fraction 0 -cancel-fraction 0
+
+# Resiliencia: tumbar un worker, ver cómo lo aíslan y recuperarlo
+curl -s -X POST localhost:8080/debug/workers/sim-worker-1/faults -d '{"down": true}'
+curl -s localhost:8080/debug/workers        # status.healthy=false, status.breaker=open (~6 s después)
+curl -s -X POST localhost:8080/debug/workers/sim-worker-1/faults -d '{}'
+task loadgen -- -rate 4 -duration 45s -chaos hang   # lo mismo, automatizado, durante una prueba de carga
 ```
 
 Los mensajes `system` cuentan para el prefijo igual que el resto: el prompt se aplana en orden (`role: content\n`) y se hashea por bloques de 64 caracteres. Dos peticiones con el mismo `system` (y el mismo modelo) comparten todos los bloques completos de ese mensaje.

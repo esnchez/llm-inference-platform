@@ -38,7 +38,25 @@ var (
 	// ErrQueueTimeout means the request waited in the queue for the maximum
 	// time without capacity being freed. The request may succeed later.
 	ErrQueueTimeout = errors.New("queue timeout")
+
+	// ErrWorkerFailure marks a failure of the worker itself (connection
+	// refused, engine 5xx, stream cut, hang), as opposed to a problem with
+	// the request or a client cancellation. Worker implementations wrap
+	// their own failures with it; only these count against the worker's
+	// circuit breaker and allow a retry on another worker (Phase 4).
+	ErrWorkerFailure = errors.New("worker failure")
+	// ErrNoHealthyWorkers means workers serve the model but none of them is
+	// healthy right now (failed health checks or open circuit breaker). The
+	// request may succeed later.
+	ErrNoHealthyWorkers = errors.New("no healthy workers")
 )
+
+// HealthStatus is what a worker reports to a health check.
+type HealthStatus struct {
+	// InstanceID identifies the running process. A different value means
+	// the worker restarted, so its caches (prefix cache) are empty.
+	InstanceID string
+}
 
 // RetryAfterError decorates a retryable admission error (ErrQueueFull,
 // ErrQueueTimeout, ErrAtCapacity) with the delay the client should wait before
@@ -111,6 +129,28 @@ type WorkerSnapshot struct {
 	PrefixCacheUsed     int    `json:"prefix_cache_used,omitempty"`
 	PrefixBlocksQueried uint64 `json:"prefix_blocks_queried,omitempty"`
 	PrefixBlocksHit     uint64 `json:"prefix_blocks_hit,omitempty"`
+	// Status is the control plane's view of the worker (Phase 4). Workers
+	// leave it nil; the scheduler fills it in its own snapshots.
+	Status *WorkerStatus `json:"status,omitempty"`
+}
+
+// WorkerStatus is the scheduler's view of a worker's lifecycle and health.
+type WorkerStatus struct {
+	// State is "active" or "draining" (removed, waiting for its leases).
+	State string `json:"state"`
+	// Healthy is the health-check verdict (with hysteresis).
+	Healthy bool `json:"healthy"`
+	// Breaker is "closed", "open" or "half-open".
+	Breaker string `json:"breaker"`
+	// Degraded workers are only used when the others have no room.
+	Degraded            bool    `json:"degraded"`
+	ITLMs               float64 `json:"itl_ms"`
+	ITLSamples          int     `json:"itl_samples"`
+	InFlight            int     `json:"in_flight"`
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+	Failures            uint64  `json:"failures"`
+	BreakerOpens        uint64  `json:"breaker_opens"`
+	InstanceID          string  `json:"instance_id,omitempty"`
 }
 
 // Worker is a data-plane node able to run inference.
@@ -131,6 +171,10 @@ type Worker interface {
 	// AcquireLease. It must never fire per token or per KV-cache block.
 	// Exactly one consumer (the scheduler's dispatcher) reads it.
 	CapacityChanged() <-chan struct{}
+	// Health checks that the worker can serve (vLLM: GET /health). It must
+	// honour ctx's deadline. An error, wrapped in ErrWorkerFailure, means
+	// not healthy. The control plane polls it periodically (Phase 4).
+	Health(ctx context.Context) (HealthStatus, error)
 }
 
 // Lease is a capacity reservation on one worker.

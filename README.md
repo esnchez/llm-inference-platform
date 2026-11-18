@@ -1,6 +1,6 @@
 # Distributed LLM Inference Platform
 
-> **Estado:** Fases 1 a 3 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md).  
+> **Estado:** Fases 1 a 4 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md).  
 > **Documentación de la implementación:** [`docs/servicio/`](docs/servicio/README.md) (componentes, recorrido de una petición, leases, relación con vLLM).  
 > **Objetivo:** Construir una plataforma de serving de LLM distribuida a nivel de producción, con routing consciente de KV-Cache (Prefix-aware), scheduling basado en capacidad de tokens (VRAM), control de concurrencia atómico mediante *leases*, y autoscaling predictivo para K8s/vLLM.
 
@@ -176,8 +176,13 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Caché de prefijos en el worker simulado, métricas de acierto previsto/real y `loadgen -prefixes`.
 
 ### Fase 4 — Resiliencia y Ciclo de Vida
-- [ ] Heartbeats y healthchecks del worker hacia el registry.
-- [ ] Circuit breakers para aislar workers degradados (latencia alta).
+> Decisiones, implementación y mediciones: [`docs/servicio/10-fase-4-decisiones.md`](docs/servicio/10-fase-4-decisiones.md). Dos cambios sobre el plan original: healthchecks activos en lugar de heartbeats (vLLM no emite heartbeats), y la latencia alta solo desprioriza un worker en vez de aislarlo.
+
+- [x] Healthchecks activos desde el registro (`Worker.Health`, histéresis 3/2) y detección de reinicios (`InstanceID`).
+- [x] Circuit breakers por worker: los abren fallos del worker y cuelgues; la latencia alta solo desprioriza (worker degradado).
+- [x] Registro de workers en caliente: alta y baja con drenaje (`/debug/workers`).
+- [x] Reintento en otro worker si falla antes del primer token; cabeceras con el primer chunk (resuelve [FI-9](#fi-9-las-cabeceras-200-se-envían-antes-de-que-el-worker-responda)).
+- [x] Fallos simulados en `simworker`, estrés con caos y `loadgen -chaos`.
 - [x] Desconexiones de clientes propagadas al worker (hecho en la Fase 1, ver [FI-5](#fi-5-solapamiento-del-roadmap)).
 
 ### Fase 5 — Observabilidad
@@ -217,6 +222,7 @@ task run -- -h                    # resto de opciones (ttft, itl-load-factor, qu
 task loadgen -- -rate 30 -duration 10s   # carga realista contra el servidor en marcha
 task loadgen -- -rate 4 -duration 60s -prefixes 24 -rag-fraction 0   # system prompts compartidos (routing por prefijos)
 task run -- -placement round-robin       # colocación de la Fase 2, para comparar
+task loadgen -- -rate 4 -duration 45s -chaos down   # tumba sim-worker-1 a mitad de la prueba (o hang, errors, stall, slow, restart)
 ```
 
 **Suite de tests** (definida en `Taskfile.yml`; `task --list` muestra todas las tareas):
@@ -241,8 +247,10 @@ task run -- -placement round-robin       # colocación de la Fase 2, para compar
 | `GET /debug/workers` | `WorkerSnapshot` de cada worker (presupuesto, reservado, leases, acierto real de su caché de prefijos). |
 | `GET /debug/scheduler` | Estado de la cola: peticiones y tokens en cola por modelo, tiempo en cola p50/p99, rechazos por motivo; con afinidad, sus contadores y el tamaño del Radix Tree (`placement`). |
 | `GET /healthz` | Liveness. |
+| `POST /debug/workers`, `DELETE /debug/workers/{id}` | Alta de un worker simulado y baja con drenaje (Fase 4). |
+| `POST /debug/workers/{id}/faults`, `.../restart` | Inyectar fallos (`{"down": true}`, `{"hang": true}`, `{"error_rate": 0.3}`, …; `{}` los quita) o simular un reinicio. |
 
-Errores de admisión (antes de enviar cabeceras): `400` petición inválida o que no cabe en ningún worker (`context_length_exceeded`), `404` modelo desconocido, `503` + `Retry-After` cuando la cola del modelo está llena (`queue_full`) o la petición no obtuvo capacidad dentro del timeout de cola (`queue_timeout`). Mientras espera en la cola, el cliente no recibe ningún byte. Un fallo a mitad de stream se notifica en banda con un evento `data: {"error": ...}`.
+Errores de admisión (antes de enviar cabeceras): `400` petición inválida o que no cabe en ningún worker (`context_length_exceeded`), `404` modelo desconocido, `503` + `Retry-After` cuando la cola del modelo está llena (`queue_full`), la petición no obtuvo capacidad dentro del timeout de cola (`queue_timeout`), ningún worker del modelo está sano (`no_healthy_workers`) o el worker falló antes del primer token y el reintento tampoco funcionó (`worker_unavailable`). Mientras espera en la cola, el cliente no recibe ningún byte; el `200` llega con el primer token. Un fallo después del primer token se notifica en banda con un evento `data: {"error": ...}`.
 
 ```bash
 curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -257,12 +265,12 @@ README.md, Taskfile.yml
 docs/servicio/                  # documentación detallada de la implementación
 platform/                       # módulo Go llm-inference-platform
 ├── go.mod
-├── cmd/platform/               # binario: flags, wiring, graceful shutdown
+├── cmd/platform/               # binario: flags, wiring, graceful shutdown, /debug de administración de workers
 ├── cmd/loadgen/                # generador de carga (Poisson, chat + RAG, cancelaciones, system prompts compartidos)
 └── internal/
     ├── inference/              # contrato core: Worker, Lease, InferenceRequest, TokenChunk, errores
-    ├── simworker/              # SimulatedWorker: presupuesto de tokens, TTFT/ITL simulados, TTL de leases, caché de prefijos
-    ├── scheduler/              # admisión (colas por modelo, dispatcher) + colocación (afinidad de prefijo o round-robin)
+    ├── simworker/              # SimulatedWorker: presupuesto de tokens, TTFT/ITL simulados, TTL de leases, caché de prefijos, fallos inyectables
+    ├── scheduler/              # admisión (colas por modelo, dispatcher), colocación (afinidad o round-robin), registro, salud, breaker, reintentos
     ├── prefix/                 # hashes de prefijo por bloque y Radix Tree de prefijos por worker
     ├── httpapi/                # API OpenAI-compatible con SSE
     └── tokens/                 # estimación de tokens (~4 caracteres/token) sin tokenizer
@@ -313,7 +321,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Problema:** el router no ve las expulsiones (*evictions*) que hace vLLM en su caché, así que el árbol puede apuntar a prefijos que ya no están. Además, la afinidad pura envía todo el tráfico de un *system prompt* popular al mismo worker y lo satura.
 - **Opciones:** TTL/LRU en las entradas del árbol; una puntuación que combine afinidad de prefijo y carga (p. ej. seguir la afinidad solo si la carga está por debajo de un umbral, o *power of two choices* entre los workers con el prefijo); replicar prefijos calientes en varios workers; usar eventos de KV-Cache del motor si la versión de vLLM los publica.
 - **Decisión (2026-11-17, Fase 3):** LRU por worker con la capacidad estimada de su caché (expulsión por hojas), afinidad solo por debajo de una carga de 0,8 y desbordamiento al menos cargado, que replica los prefijos calientes sin configurarlos. En el simulador, el acierto previsto por el árbol quedó a menos de 1 punto del real, y un único *system prompt* para todo el tráfico se replicó en los 3 workers tras 2 desbordamientos. Ver [`09`](docs/servicio/09-fase-3-routing-por-prefijos.md).
-- **Sigue abierto:** el árbol imita la caché porque una sola réplica ve todo el tráfico (FI-2); no ve reinicios de workers (Fase 4) ni las diferencias de la *chat template* real; los eventos de KV-Cache de vLLM se valorarán en la Fase 6.
+- **Sigue abierto:** el árbol imita la caché porque una sola réplica ve todo el tráfico (FI-2); desde la Fase 4 detecta los reinicios de workers (cambio de `InstanceID`), pero no ve las diferencias de la *chat template* real; los eventos de KV-Cache de vLLM se valorarán en la Fase 6.
 - **Revisar:** en la Fase 6, con la caché real de vLLM.
 
 ### FI-7. El contrato solo transporta el prompt aplanado
@@ -332,4 +340,4 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Decisión actual:** tras obtener el lease, el handler escribe `200` y las cabeceras SSE antes de que `ExecuteStream` produzca el primer chunk.
 - **Problema:** vLLM puede rechazar la petición al empezar (p. ej. `prompt + max_tokens` mayor que `--max-model-len` según su tokenizer real, que puede no coincidir con nuestra estimación, FI-3). Ese rechazo llegaría como error *en banda* dentro de un stream `200`, en lugar de un `400` que los clientes y los benchmarks clasifican correctamente.
 - **Opciones:** retrasar la escritura de cabeceras hasta el primer chunk o hasta la primera respuesta de vLLM (el cliente no recibe cabeceras hasta que el worker responde, y el handler se complica); validar la longitud con el tokenizer real antes de admitir (ligado a FI-3).
-- **Revisar:** al empezar el `VLLMAdapter` (Fase 6).
+- **Resuelto (2026-11-18, Fase 4):** las cabeceras se envían con el primer chunk. Un fallo antes del primer token se reintenta en otro worker y, si no se puede, llega al cliente con su código (`503 worker_unavailable`, o `400` si el motor rechaza la petición). Queda para la Fase 6 que el `VLLMAdapter` traduzca el `400` de vLLM a `ErrRequestTooLarge` y no a `ErrWorkerFailure`. Ver [`10`](docs/servicio/10-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9).

@@ -34,6 +34,7 @@ type Worker interface {
     AcquireLease(ctx context.Context, req InferenceRequest) (Lease, error)
     Snapshot() WorkerSnapshot
     CapacityChanged() <-chan struct{} // Fase 2
+    Health(ctx context.Context) (HealthStatus, error) // Fase 4
 }
 
 type Lease interface {
@@ -55,6 +56,15 @@ Reglas que toda implementación (simulada o vLLM) debe cumplir:
 | `CapacityChanged()` se emite **una vez por lease liberado**, agrupada (canal con buffer 1 y envío no bloqueante) y sin datos. | El dispatcher reintenta en cuanto hay capacidad, sin sondeo ni tormentas de eventos. Perderla o duplicarla no rompe nada: la verdad está en `AcquireLease` ([08 · Decisión 2](08-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)). |
 | Un lease no ejecutado **expira** tras el TTL (`ErrLeaseExpired`). | Un lease que nadie ejecuta (bug, *panic*, cliente perdido entre admisión y stream) retendría capacidad para siempre. |
 | Los errores se comparan con `errors.Is`. | Las implementaciones pueden añadir contexto (`"w1: at capacity"`) sin romper la clasificación. |
+
+Reglas añadidas en la Fase 4 ([10](10-fase-4-decisiones.md)):
+
+| Regla | Motivo |
+| :--- | :--- |
+| Los fallos **del propio worker** (conexión rechazada, `5xx`, stream cortado) se envuelven con `ErrWorkerFailure`; los de la petición, no. | Solo los primeros cuentan para el *circuit breaker* y permiten reintentar en otro worker. Un `400` del motor por una petición demasiado larga no debe aislar a un worker sano. |
+| `Health` respeta el deadline de `ctx` y devuelve un `InstanceID` que cambia si el proceso se reinicia. | El scheduler lo consulta periódicamente. Un `InstanceID` nuevo significa caché de prefijos vacía. |
+
+**El lease que devuelve el scheduler envuelve al del worker** (`scheduler/lease.go`). Cumple el mismo contrato, y además: corta los streams colgados, informa al breaker de cómo acabó cada uno y, si el worker falla antes del primer token, ejecuta la petición en otro worker dentro de la misma llamada a `ExecuteStream`. Por eso `WorkerID()` puede cambiar durante la ejecución: hay que leerlo tras el primer chunk o al final.
 
 ### Patrón de uso
 

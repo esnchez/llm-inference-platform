@@ -49,6 +49,12 @@ func run() error {
 		affinityLoad  = flag.Float64("affinity-max-load", 0.8, "ledger load above which a worker stops getting requests for prefix affinity alone")
 		affinityMin   = flag.Int("affinity-min-blocks", 4, "shortest cached prefix that counts as affinity, in blocks of 16 tokens")
 		prefixCache   = flag.Int("prefix-cache-blocks", -1, "simulated prefix cache per worker, in blocks of 16 tokens; -1 = token-budget/16, 0 = disabled")
+		healthEvery   = flag.Duration("health-interval", 2*time.Second, "how often each worker is health-checked; negative = no health checks")
+		breakerFails  = flag.Int("breaker-failures", 5, "consecutive worker failures that open its circuit breaker")
+		breakerWait   = flag.Duration("breaker-cooldown", 10*time.Second, "how long a breaker stays open before a probe (doubles on each reopening, max 2m)")
+		ttftTimeout   = flag.Duration("ttft-timeout", 10*time.Second, "a stream with no first token after this (+1ms per prompt token) is a hung worker")
+		stallTimeout  = flag.Duration("stall-timeout", 10*time.Second, "a stream with no new token for this long is a hung worker")
+		maxRetries    = flag.Int("max-retries", 1, "retries on another worker when one fails before the first token; -1 = none")
 		shutdownGrace = flag.Duration("shutdown-grace", 15*time.Second, "time given to in-flight streams on shutdown")
 	)
 	flag.Parse()
@@ -61,20 +67,20 @@ func run() error {
 	if cacheBlocks < 0 {
 		cacheBlocks = *budget / prefix.BlockTokens
 	}
+	pool := newSimPool(simworker.Config{
+		Models:            modelList,
+		TokenBudget:       *budget,
+		BaseTTFT:          *baseTTFT,
+		PrefillPerToken:   *prefill,
+		InterTokenLatency: *itl,
+		LeaseTTL:          *leaseTTL,
+		MeanOutputTokens:  *meanOutput,
+		ITLLoadFactor:     *itlLoad,
+		PrefixCacheBlocks: cacheBlocks,
+	})
 	workers := make([]inference.Worker, 0, *numWorkers)
-	for i := 0; i < *numWorkers; i++ {
-		w, err := simworker.New(simworker.Config{
-			ID:                fmt.Sprintf("sim-worker-%d", i+1),
-			Models:            modelList,
-			TokenBudget:       *budget,
-			BaseTTFT:          *baseTTFT,
-			PrefillPerToken:   *prefill,
-			InterTokenLatency: *itl,
-			LeaseTTL:          *leaseTTL,
-			MeanOutputTokens:  *meanOutput,
-			ITLLoadFactor:     *itlLoad,
-			PrefixCacheBlocks: cacheBlocks,
-		})
+	for range *numWorkers {
+		w, err := pool.newWorker()
 		if err != nil {
 			return err
 		}
@@ -102,13 +108,25 @@ func run() error {
 		QueueTokenFactor:  *queueFactor,
 		MaxQueuedRequests: *maxQueued,
 		Placement:         place,
+
+		HealthInterval:  *healthEvery,
+		BreakerFailures: *breakerFails,
+		BreakerCooldown: *breakerWait,
+		TTFTTimeout:     *ttftTimeout,
+		StallTimeout:    *stallTimeout,
+		MaxRetries:      *maxRetries,
 	}, workers...)
 	defer sched.Close()
+	pool.sched = sched
 	api := httpapi.New(sched, cfg, log)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", api.Handler())
+	pool.register(mux) // POST/DELETE /debug/workers...: add, drain, break, restart
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           api.Handler(),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: it would cut long-lived SSE streams.
 	}

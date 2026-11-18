@@ -66,6 +66,18 @@ func (c *prefixCache) use(hashes []uint64) int {
 	return matched
 }
 
+// clear empties the cache (a restarted engine loses its KV cache). The
+// counters are kept: they describe the worker, not one process.
+func (c *prefixCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lru.Init()
+	clear(c.byHash)
+}
+
 func (c *prefixCache) stats() (capacity, used int, queried, hit uint64) {
 	if c == nil {
 		return 0, 0, 0, 0

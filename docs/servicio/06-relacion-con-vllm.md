@@ -15,6 +15,7 @@ El objetivo final es que cada worker sea un servidor **vLLM** con una GPU. Este 
 | Reutilizar prefijos ya calculados (*prefix caching*) | ✅ Fase 3: enviar la petición al worker que ya los tiene (radix tree aproximado) | ✅ dentro de su GPU |
 | Tokenizar y aplicar la *chat template* del modelo | ❌ hoy solo estima (FI-3) | ✅ |
 | Abortar y liberar memoria al cancelar | ✅ propaga la cancelación | ✅ libera los bloques |
+| Detectar GPUs caídas o colgadas y desviar el tráfico | ✅ Fase 4: healthchecks, *circuit breaker*, timeouts de cuelgue, reintento antes del primer token | ⚠️ solo informa (`/health`) de su propio proceso |
 | Kernels CUDA, ejecución del modelo | ❌ (no objetivo) | ✅ |
 
 En una frase: **vLLM optimiza una GPU; la plataforma optimiza el clúster de GPUs.** vLLM no sabe que existen otras réplicas, así que no puede decidir que una petición iría mejor a otra GPU que ya tiene su prefijo cacheado, ni rechazar pronto porque todo el clúster está saturado.
@@ -34,6 +35,8 @@ En una frase: **vLLM optimiza una GPU; la plataforma optimiza el clúster de GPU
 | `prefix.Tree` en el router | No existe en vLLM: es la vista del clúster que ninguna GPU tiene. |
 | `ctx.Done()` → liberación | Al cerrar la conexión HTTP, el servidor de vLLM aborta la petición y libera sus bloques. |
 | `AcquireLease` atómico | **No existe en vLLM.** Ver abajo. |
+| `Worker.Health` / `HealthStatus.InstanceID` (Fase 4) | `GET /health` (200 si el motor está vivo). vLLM no expone un identificador de instancia en `/health`: candidatos a comprobar con la versión fijada son `process_start_time_seconds` de `/metrics` o el *uptime* del pod. |
+| `ErrWorkerFailure` (Fase 4) | Lo que el adaptador debe envolver: conexión rechazada, `5xx`, stream SSE cortado. **No** un `400` (p. ej. `--max-model-len`), que es un error de la petición. |
 | `ErrAtCapacity` | No hay equivalente directo: vLLM acepta y encola, o expulsa (*preempt*) peticiones si se queda sin bloques. |
 
 ## Lo que la simulación no captura (y por qué importa)
@@ -101,7 +104,7 @@ Son consecuencias del contrato de la Fase 1 que conviene resolver antes de, o du
 
 1. **`InferenceRequest` solo lleva el prompt aplanado.** `renderPrompt` convierte los mensajes en `role: content\n` únicamente para estimar el coste. vLLM necesita los `messages` originales para aplicar la *chat template* del modelo, y también los parámetros de muestreo que hoy se ignoran (`temperature`, `top_p`, `stop`, …). El contrato tendrá que transportar los mensajes y esos parámetros, o el cuerpo original de la petición (**FI-7**).
 2. **Un `TokenChunk` no siempre es exactamente un token.** vLLM normalmente emite un token por evento, pero puede agrupar varios (por ejemplo, al retener bytes de un carácter UTF-8 incompleto, o con *speculative decoding*). Hoy `completion_tokens` se calcula contando chunks; con vLLM debería tomarse del `usage` que devuelve el propio motor (**FI-8**).
-3. **Las cabeceras `200` se envían antes de que el worker responda.** Con el simulador no importa, pero vLLM puede rechazar la petición al empezar (por ejemplo, `prompt + max_tokens` mayor que `--max-model-len` según su tokenizer real, que puede no coincidir con nuestra estimación). Con el diseño actual ese rechazo llegaría como error *en banda* dentro de un stream `200`. Una alternativa es esperar al primer chunk (o a la primera respuesta de vLLM) antes de escribir las cabeceras, a costa de complicar el handler (**FI-9**).
+3. ~~**Las cabeceras `200` se envían antes de que el worker responda.**~~ **Resuelto en la Fase 4:** el handler espera al primer chunk para enviar el `200`, así que un rechazo de vLLM al empezar llega al cliente con su código (**FI-9**). Para que sea un `400` y no un `503`, el adaptador debe traducir el `400` de vLLM a `ErrRequestTooLarge` o `ErrInvalidRequest`, nunca a `ErrWorkerFailure`.
 4. **`PrefixHashes` no le sirve a vLLM.** El adaptador no lo enviará: vLLM calcula sus propios hashes sobre los tokens reales. El router seguirá usándolos para su árbol. Hay que comprobar que la *chat template* del modelo no inserta texto variable al principio del prompt (fechas, IDs), porque rompería en vLLM prefijos que el router cree compartidos ([09 · Limitaciones](09-fase-3-routing-por-prefijos.md#limitaciones-y-trabajo-futuro)).
 5. **El `finish_reason` real** puede ser `stop` (fin natural, *stop sequence*) además de `length`; el tipo `FinishReason` ya lo contempla.
 

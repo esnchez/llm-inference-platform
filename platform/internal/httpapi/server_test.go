@@ -319,3 +319,74 @@ func TestRequestsCarryPrefixHashes(t *testing.T) {
 		t.Fatalf("a prompt shorter than a block has hashes: %v", short.PrefixHashes)
 	}
 }
+
+// newPoolServer serves model with the given simulated workers.
+func newPoolServer(t *testing.T, scfg scheduler.Config, workers ...*simworker.Worker) *httptest.Server {
+	t.Helper()
+	ws := make([]inference.Worker, len(workers))
+	for i, w := range workers {
+		ws[i] = w
+	}
+	sched := scheduler.New(scfg, ws...)
+	t.Cleanup(sched.Close)
+	ts := httptest.NewServer(New(sched, DefaultConfig(), slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func sim(t *testing.T, id string, f simworker.Faults) *simworker.Worker {
+	t.Helper()
+	w, err := simworker.New(simworker.Config{ID: id, Models: []string{model}, TokenBudget: 1000, Faults: f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+func TestFailureBeforeFirstTokenGetsAStatusCode(t *testing.T) {
+	ts := newPoolServer(t, scheduler.Config{HealthInterval: -1}, sim(t, "w1", simworker.Faults{Down: true}))
+	for _, stream := range []bool{true, false} {
+		resp := post(t, context.Background(), ts.URL, chatBody(4, stream, ""))
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"worker_unavailable"`) {
+			t.Fatalf("stream=%v: %d %s", stream, resp.StatusCode, body)
+		}
+		if resp.Header.Get("Retry-After") == "" || strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			t.Fatalf("stream=%v: headers %v", stream, resp.Header)
+		}
+	}
+}
+
+func TestRetryIsInvisibleToTheClient(t *testing.T) {
+	ts := newPoolServer(t, scheduler.Config{HealthInterval: -1, BreakerFailures: 100, Placement: &scheduler.RoundRobin{}},
+		sim(t, "down", simworker.Faults{Down: true}), sim(t, "up", simworker.Faults{}))
+	for i := range 4 {
+		resp := post(t, context.Background(), ts.URL, chatBody(3, true, ""))
+		events := readEvents(t, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Worker-Id") != "up" || events[len(events)-1] != "[DONE]" {
+			t.Fatalf("request %d: %d on %q, events %v", i, resp.StatusCode, resp.Header.Get("X-Worker-Id"), events)
+		}
+	}
+}
+
+func TestNoHealthyWorkers(t *testing.T) {
+	ts := newPoolServer(t, scheduler.Config{HealthInterval: 2 * time.Millisecond}, sim(t, "w1", simworker.Faults{Down: true}))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		resp := post(t, context.Background(), ts.URL, chatBody(3, true, ""))
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(body), `"no_healthy_workers"`) {
+			if resp.Header.Get("Retry-After") == "" {
+				t.Fatal("no Retry-After")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never got no_healthy_workers; last: %d %s", resp.StatusCode, body)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

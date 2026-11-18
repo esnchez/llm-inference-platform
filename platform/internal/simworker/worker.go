@@ -48,6 +48,9 @@ type Config struct {
 	// uncached prompt tokens. Zero disables the cache (every prompt token is
 	// prefilled).
 	PrefixCacheBlocks int
+	// Faults are the failures injected from the start (see Faults); they
+	// can be changed later with SetFaults.
+	Faults Faults
 }
 
 // Worker is a simulated inference worker. It is safe for concurrent use.
@@ -57,11 +60,14 @@ type Worker struct {
 	capacity chan struct{} // buffer 1: CapacityChanged signal
 	cache    *prefixCache  // nil when PrefixCacheBlocks is 0
 
-	mu       sync.Mutex
-	reserved int
-	active   int
-	granted  uint64
-	rejected uint64
+	mu        sync.Mutex
+	reserved  int
+	active    int
+	granted   uint64
+	rejected  uint64
+	faults    Faults        // see faults.go
+	instance  uint64        // bumped by Restart
+	restarted chan struct{} // closed by Restart, then replaced
 }
 
 var _ inference.Worker = (*Worker)(nil)
@@ -85,7 +91,11 @@ func New(cfg Config) (*Worker, error) {
 		models[m] = struct{}{}
 	}
 	cfg.Models = append([]string(nil), cfg.Models...)
-	w := &Worker{cfg: cfg, models: models, capacity: make(chan struct{}, 1)}
+	if err := cfg.Faults.validate(); err != nil {
+		return nil, err
+	}
+	w := &Worker{cfg: cfg, models: models, capacity: make(chan struct{}, 1),
+		faults: cfg.Faults, restarted: make(chan struct{})}
 	if cfg.PrefixCacheBlocks > 0 {
 		w.cache = newPrefixCache(cfg.PrefixCacheBlocks)
 	}
@@ -276,13 +286,30 @@ func (l *lease) ExecuteStream(ctx context.Context, out chan<- inference.TokenChu
 	defer l.Release()
 
 	cfg := l.w.cfg
+	seed := seedFor(l.req.ID)
+	faults, restarted := l.w.streamFaults()
+	switch {
+	case faults.Down:
+		return l.w.failure("down")
+	case failsAtStart(faults, seed):
+		return l.w.failure("injected error")
+	case faults.Hang:
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-restarted:
+			return l.w.failure("restarted")
+		}
+	}
+	slow := max(faults.Slowdown, 1)
+
 	cached := min(l.w.cache.use(l.req.PrefixHashes)*prefix.BlockTokens, l.req.PromptTokens)
 	ttft := cfg.BaseTTFT + time.Duration(l.req.PromptTokens-cached)*cfg.PrefillPerToken
+	ttft = time.Duration(float64(ttft) * slow)
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	defer timer.Stop()
 
-	seed := seedFor(l.req.ID)
 	n := l.w.outputTokens(seed, l.req.MaxNewTokens)
 	finish := inference.FinishLength
 	if n < l.req.MaxNewTokens {
@@ -290,15 +317,28 @@ func (l *lease) ExecuteStream(ctx context.Context, out chan<- inference.TokenChu
 	}
 	last := n - 1
 	for i := 0; i <= last; i++ {
+		if i > 0 && i == faults.FailAfterTokens {
+			return l.w.failure(fmt.Sprintf("stream cut after %d tokens", i))
+		}
+		if i > 0 && i == faults.StallAfterTokens {
+			select { // stalled: nothing more until cancelled
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-restarted:
+				return l.w.failure("restarted")
+			}
+		}
 		delay := ttft
 		if i > 0 {
-			delay = l.w.interTokenLatency()
+			delay = time.Duration(float64(l.w.interTokenLatency()) * slow)
 		}
 		if delay > 0 {
 			timer.Reset(delay)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-restarted:
+				return l.w.failure("restarted")
 			case <-timer.C:
 			}
 		} else if err := ctx.Err(); err != nil {
@@ -312,6 +352,8 @@ func (l *lease) ExecuteStream(ctx context.Context, out chan<- inference.TokenChu
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-restarted:
+			return l.w.failure("restarted")
 		case out <- chunk:
 		}
 	}

@@ -58,7 +58,7 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | :--- | :--- |
 | `task check` | En cada cambio: `gofmt` + `go vet` + tests. |
 | `task check:all` | Antes de cerrar una fase: `check` + tests con `-race` en Docker. |
-| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %). |
+| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %). |
 | `task loadgen` | Generador de carga contra un servidor en marcha (no es un test: sirve para comparar configuraciones). |
 
 ### `internal/simworker` — contrato del lease
@@ -83,6 +83,14 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | `TestPrefixCacheEvictsTailsBeforeSharedHeads` | La LRU expulsa las colas de las peticiones antes que el prefijo compartido. |
 | `TestPrefixCacheShortensTTFT` | Un prompt de 800 tokens ya cacheado se salta el prefill; `Snapshot` refleja tamaño y aciertos. |
 | `TestNoPrefixCacheByDefault` | Sin `PrefixCacheBlocks`, los hashes se ignoran (comportamiento de las fases 1 y 2). |
+| `TestFaultsValidate` | Fallos con valores inválidos se rechazan en `New` y en `SetFaults`. |
+| `TestDownFailsStreamsAndHealth` | `Down`: streams y `Health` fallan con `ErrWorkerFailure`, sin perder capacidad; al quitarlo, vuelve a funcionar. |
+| `TestErrorRateIsSeededByRequestID` | `ErrorRate` falla la proporción pedida y el mismo ID da siempre el mismo resultado. |
+| `TestHangEmitsNothingUntilCancelled` | `Hang`: ningún token hasta cancelar; `Health` sigue bien. |
+| `TestFailAndStallAfterTokens` | Corte y parada a mitad de stream tras N tokens. |
+| `TestSlowdownMultipliesLatency` | `Slowdown` multiplica el TTFT. |
+| `TestRestartCutsStreamsAndChangesInstance` | `Restart` corta los streams, libera su capacidad, vacía la caché y cambia el `InstanceID`. |
+| `TestHealthHonoursContext` | `Health` respeta un contexto cancelado. |
 
 ### `internal/scheduler` — admisión, cola y colocación
 
@@ -118,6 +126,25 @@ Los tests usan un sondeo de seguridad de 1 hora, así que demuestran que es la s
 | `TestAffinityErrors` | Sin workers o con el pool lleno → `ErrAtCapacity`; un contexto cancelado se propaga; los fallos no se registran. |
 | `TestSchedulerWithAffinity` | Integración con la cola: una petición en espera entra por desbordamiento al liberarse capacidad, y los contadores llegan a `Stats().Placement`. |
 
+`lifecycle_test.go` (Fase 4). Usan un reloj falso para las esperas del breaker y workers con fallos inyectados:
+
+| Test | Qué garantiza |
+| :--- | :--- |
+| `TestBreakerOpensProbesAndCloses` | 2 fallos abren el breaker (`503 no_healthy_workers` con `Retry-After`); tras la espera, una sola prueba; una prueba fallida reabre con el doble de espera; una buena lo cierra. |
+| `TestRequestErrorsDoNotCountAgainstTheWorker` | Un error de la petición (`ErrRequestTooLarge` del motor) no cuenta como fallo del worker ni se reintenta. |
+| `TestRetryBeforeFirstTokenOnAnotherWorker` | Con un worker caído, todas las peticiones terminan en el otro; reintentos = éxitos de reintento = fallos; sin fugas de capacidad. |
+| `TestNoRetryAfterTheFirstToken` | Un corte tras 2 tokens llega al cliente y no se reintenta. |
+| `TestRetriesAreBounded` | Con todos los workers caídos, un solo reintento por petición. |
+| `TestHangDetectedBeforeFirstTokenIsRetried` | Un worker colgado se detecta por el timeout de TTFT, se libera su capacidad y la petición termina en otro. |
+| `TestStallMidStreamIsAWorkerFailure` | Una parada a mitad de stream se detecta por `StallTimeout`. |
+| `TestHealthChecksExcludeAndReadmit` | Un worker que falla los healthchecks queda excluido (breaker abierto) y vuelve tras recuperarse, la espera y una prueba. |
+| `TestRestartForgetsCachedPrefixes` | Un cambio de `InstanceID` borra los prefijos del worker en el radix tree. |
+| `TestAddWorkerAdmitsQueuedRequests` | Un worker nuevo admite una petición que esperaba en la cola; IDs duplicados se rechazan; `Models()` se actualiza. |
+| `TestRemoveWorkerDrains` | Un worker en baja no recibe peticiones nuevas, su stream en curso termina, luego desaparece (también del árbol); sin workers, `404`. |
+| `TestDegradedWorkerOnlyUsedWhenOthersAreFull` | Un worker 10× más lento queda degradado y solo se usa cuando el otro está lleno. |
+
+`TestStressInvariants` tiene además un subtest `chaos`: las mismas 1.500 peticiones mientras una goroutine cambia los fallos de los workers al azar cada 3 ms (errores, caída, cuelgue, corte, parada, lentitud y reinicios), con healthchecks, breaker y reintentos activos. Comprueba las mismas invariantes (presupuesto nunca superado, un resultado por petición, cola y ledgers vacíos, sin goroutines vivas) y además que no queda ningún grant sin terminar.
+
 ### `internal/prefix` — hashes y radix tree
 
 | Test | Qué garantiza |
@@ -145,15 +172,18 @@ Usan workers simulados reales detrás de un servidor HTTP real:
 | `TestClientDisconnectReleasesCapacity` | Una desconexión del cliente a mitad de stream libera la capacidad. |
 | `TestModelsAndDebugEndpoints` | `/v1/models` y `/debug/workers`. |
 | `TestRequestsCarryPrefixHashes` | Dos chats con el mismo `system` comparten los hashes de sus bloques; los mensajes distintos acaban en bloques distintos; un prompt corto no lleva hashes. |
+| `TestFailureBeforeFirstTokenGetsAStatusCode` | Con el único worker caído, streaming y no streaming responden `503 worker_unavailable` con `Retry-After`, sin cabeceras SSE (FI-9). |
+| `TestRetryIsInvisibleToTheClient` | Con un worker caído y otro sano, todas las respuestas son `200` completas y `X-Worker-Id` es el sano. |
+| `TestNoHealthyWorkers` | Cuando los healthchecks marcan el único worker, la respuesta es `503 no_healthy_workers` con `Retry-After`. |
 
 ### Huecos conocidos
 
 - `internal/tokens` no tiene tests (0 % de cobertura).
 - La comparación de colocaciones (TTFT, acierto de caché) se mide con `loadgen` contra el binario, no con un test: depende de tiempos reales.
-- `PrefixAffinity.RemoveWorker` no tiene test propio (lo cubre `TestTreeRemoveWorker`) y nadie lo llama hasta la Fase 4.
+- Los endpoints de administración de `cmd/platform` no tienen tests automáticos: se probaron a mano contra el binario (alta, fallos, campo desconocido, baja con drenaje, reinicio).
 - La comprobación del pico de reserva sigue siendo por muestreo (después de cada concesión), tanto en `simworker` como en el test de estrés del scheduler.
 - La prueba del binario completo (arrancarlo y lanzar peticiones con `curl`) se hizo a mano; un test *end-to-end* en Go que arranque el servidor sería la forma portable de automatizarla.
 - No hay un test que fuerce el vencimiento del TTL *después* de salir de la cola; el camino normal (cola → handler con TTL activo) sí está cubierto.
-- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
+- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Al cerrar la Fase 4 (2026-11-18) también, incluido el estrés con caos. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
 
 La estrategia de tests de la Fase 2 (contrato, estrés con invariantes y generador de carga) está en [08 · Decisión 7](08-fase-2-decisiones.md#decisión-7-tests-carga-y-métricas-mínimas).

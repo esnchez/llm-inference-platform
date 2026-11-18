@@ -9,7 +9,9 @@
 // that give up after a random delay. With -prefixes N, chat requests start
 // with one of N long system prompts (uniform, or Zipf with -prefix-skew) to
 // exercise prefix-affinity routing (Phase 3); the report then adds the
-// workers' real prefix-cache hit rate. It compares scheduling policies with
+// workers' real prefix-cache hit rate. With -chaos, one worker is broken
+// (down, hung, failing, slow or restarted) through the platform's
+// /debug/workers/{id}/faults endpoint for part of the run (Phase 4). It compares scheduling policies with
 // the simulator; llmperf takes over against real vLLM in Phase 6.
 package main
 
@@ -55,6 +57,10 @@ func main() {
 		prefixes  = flag.Int("prefixes", 0, "number of distinct system prompts shared by chat requests; 0 = no system prompt")
 		sysChars  = flag.Int("system-chars", 6000, "size of each system prompt, in characters (~4 per token)")
 		skew      = flag.Float64("prefix-skew", 0, "Zipf exponent (> 1) for choosing the system prompt, so a few are hot; 0 = uniform")
+		chaos     = flag.String("chaos", "", "break one worker during the run: down, hang, errors (50% of streams fail), stall, slow or restart; empty = none")
+		chaosWkr  = flag.String("chaos-worker", "sim-worker-1", "worker that -chaos breaks")
+		chaosAt   = flag.Duration("chaos-at", 0, "when the fault starts; 0 = a third into -duration")
+		chaosFor  = flag.Duration("chaos-for", 0, "how long it lasts; 0 = a third of -duration")
 	)
 	flag.Parse()
 	if *rate <= 0 || *duration <= 0 {
@@ -84,6 +90,19 @@ func main() {
 		wg       sync.WaitGroup
 	)
 	start := time.Now()
+	if *chaos != "" {
+		at, span := *chaosAt, *chaosFor
+		if at <= 0 {
+			at = *duration / 3
+		}
+		if span <= 0 {
+			span = *duration / 3
+		}
+		if err := scheduleChaos(client, *url, *chaos, *chaosWkr, at, span); err != nil {
+			fmt.Fprintln(os.Stderr, "loadgen:", err)
+			os.Exit(2)
+		}
+	}
 	sent := 0
 	for next := time.Duration(0); next < *duration; next += time.Duration(rng.ExpFloat64() / *rate * float64(time.Second)) {
 		time.Sleep(time.Until(start.Add(next)))
@@ -114,6 +133,47 @@ func main() {
 	report(os.Stdout, outcomes, sent, sendWindow, time.Since(start))
 	printPrefixCache(os.Stdout, client, *url)
 	printSchedulerStats(os.Stdout, client, *url)
+}
+
+// scheduleChaos breaks worker at the given offset and repairs it span
+// later, through the platform's debug endpoints.
+func scheduleChaos(client *http.Client, url, kind, worker string, at, span time.Duration) error {
+	faults := map[string]string{
+		"down":   `{"down": true}`,
+		"hang":   `{"hang": true}`,
+		"errors": `{"error_rate": 0.5}`,
+		"stall":  `{"stall_after_tokens": 5}`,
+		"slow":   `{"slowdown": 4}`,
+	}
+	post := func(path, body string) {
+		resp, err := client.Post(url+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "loadgen: chaos %s: %v\n", path, err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			fmt.Fprintf(os.Stderr, "loadgen: chaos %s: HTTP %d\n", path, resp.StatusCode)
+		}
+	}
+	base := "/debug/workers/" + worker
+	if kind == "restart" {
+		time.AfterFunc(at, func() { post(base+"/restart", "") })
+		return nil
+	}
+	body, ok := faults[kind]
+	if !ok {
+		return fmt.Errorf("unknown -chaos %q (want down, hang, errors, stall, slow or restart)", kind)
+	}
+	time.AfterFunc(at, func() {
+		fmt.Fprintf(os.Stderr, "loadgen: %s: %s %s\n", time.Now().Format("15:04:05.000"), worker, kind)
+		post(base+"/faults", body)
+	})
+	time.AfterFunc(at+span, func() {
+		fmt.Fprintf(os.Stderr, "loadgen: %s: %s repaired\n", time.Now().Format("15:04:05.000"), worker)
+		post(base+"/faults", "{}")
+	})
+	return nil
 }
 
 func send(client *http.Client, url, model, system, prompt string, maxTokens int, giveUp time.Duration) outcome {
@@ -234,6 +294,11 @@ func printPrefixCache(w io.Writer, client *http.Client, url string) {
 		Used     int    `json:"prefix_cache_used"`
 		Queried  uint64 `json:"prefix_blocks_queried"`
 		Hit      uint64 `json:"prefix_blocks_hit"`
+		Status   struct {
+			Healthy  bool   `json:"healthy"`
+			Breaker  string `json:"breaker"`
+			Failures uint64 `json:"failures"`
+		} `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&workers); err != nil {
 		fmt.Fprintln(w, "/debug/workers:", err)
@@ -246,11 +311,11 @@ func printPrefixCache(w io.Writer, client *http.Client, url string) {
 		return 100 * float64(hit) / float64(queried)
 	}
 	var hit, queried uint64
-	fmt.Fprintln(w, "prefix cache (real, per worker, since start):")
+	fmt.Fprintln(w, "workers (since start): leases, real prefix-cache hit rate, health, breaker, failures:")
 	for _, s := range workers {
 		hit, queried = hit+s.Hit, queried+s.Queried
-		fmt.Fprintf(w, "  %-14s leases %6d  cache %5d/%-5d blocks  hit rate %5.1f%%\n",
-			s.ID, s.Granted, s.Used, s.Capacity, rate(s.Hit, s.Queried))
+		fmt.Fprintf(w, "  %-14s leases %6d  cache %5d/%-5d blocks  hit rate %5.1f%%  healthy %-5v breaker %-9s failures %d\n",
+			s.ID, s.Granted, s.Used, s.Capacity, rate(s.Hit, s.Queried), s.Status.Healthy, s.Status.Breaker, s.Status.Failures)
 	}
 	fmt.Fprintf(w, "  %-14s %42s hit rate %5.1f%%\n\n", "total", "", rate(hit, queried))
 }

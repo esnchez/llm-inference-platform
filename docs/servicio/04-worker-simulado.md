@@ -13,6 +13,7 @@ El proyecto arranca sin GPU. `simworker.Worker` imita lo suficiente el comportam
 | Abortar una petición y liberar sus bloques | `ctx.Done()` → retorno inmediato → liberación | Alta. |
 | Longitud de salida | Exponencial con media `MeanOutputTokens`, acotada por `MaxNewTokens` y determinista por ID; `finish_reason: stop` si para antes | Media: la forma de la distribución es una suposición. |
 | Contenido | Palabras falsas deterministas | Irrelevante para el control plane. |
+| Fallos (Fase 4) | `Faults`: errores al empezar, caída, cuelgue, corte o parada a mitad de stream, lentitud y reinicio | Media: cubre los fallos típicos de un servidor de inferencia, no su frecuencia real. |
 | *Continuous batching*, *preemption* | No se simulan | — |
 
 ## Configuración
@@ -29,6 +30,7 @@ type Config struct {
     MeanOutputTokens  int           // media de la salida; 0 = siempre MaxNewTokens
     ITLLoadFactor     float64       // crecimiento de la ITL por lease activo extra; 0 = constante
     PrefixCacheBlocks int           // caché de prefijos, en bloques de 16 tokens; 0 = sin caché
+    Faults            Faults        // fallos inyectados desde el arranque (Fase 4); también SetFaults
 }
 ```
 
@@ -81,12 +83,28 @@ Imita el *automatic prefix caching* de vLLM, lo justo para medir el router por p
 
 Con `-prefill-per-token 100us`, un *system prompt* de 1.500 tokens cuesta 150 ms de prefill la primera vez en cada worker y 0 las siguientes.
 
+## Fallos simulados (Fase 4)
+
+Para que los healthchecks, el *circuit breaker* y los reintentos tengan algo que detectar ([10 · Decisión 6](10-fase-4-decisiones.md#decisión-6-fallos-simulados-en-simworker)). Se configuran en `Config.Faults` o en caliente con `SetFaults` (y desde `POST /debug/workers/{id}/faults`). Cada stream lee los fallos **al empezar**: cambiarlos no afecta a los streams en curso.
+
+| Campo (`json`) | Efecto | Imita |
+| :--- | :--- | :--- |
+| `ErrorRate` (`error_rate`) | Esa fracción de streams falla al empezar con `ErrWorkerFailure`. El sorteo usa la semilla del ID de la petición: es reproducible. | Conexión rechazada, `5xx` |
+| `Down` (`down`) | Todo stream y todo `Health` fallan. `AcquireLease` sigue concediendo, porque con vLLM el ledger vive en el control plane. | Proceso caído |
+| `Hang` (`hang`) | El stream no emite nada hasta que se cancela. `Health` **sigue respondiendo bien**: solo lo detecta el timeout de TTFT del scheduler. | GPU colgada |
+| `StallAfterTokens` (`stall_after_tokens`) | Tras N tokens, deja de emitir sin fallar. | Cuelgue a mitad de decode |
+| `FailAfterTokens` (`fail_after_tokens`) | Tras N tokens, falla con `ErrWorkerFailure`. | Conexión cortada a mitad de stream |
+| `Slowdown` (`slowdown`) | Multiplica el TTFT y la ITL. | *Throttling*, vecino ruidoso |
+
+`Restart()` simula un reinicio: los streams en curso fallan con `ErrWorkerFailure`, la caché de prefijos se vacía y el `InstanceID` que devuelve `Health` cambia (`sim-worker-1#0` → `sim-worker-1#1`). Los fallos inyectados se mantienen.
+
 ## Lo que el simulador permite validar hoy
 
 - **Admisión y cola:** con presupuestos pequeños (`-token-budget 600`) las peticiones esperan en la cola; `/debug/scheduler` muestra la espera y los `503` por cola llena o timeout. `task loadgen` genera tráfico realista para comparar configuraciones.
 - **Reparto:** `/debug/workers` muestra cómo la colocación reparte leases (`leases_granted`, `leases_rejected`).
 - **Routing por prefijos:** `task loadgen -- -prefixes 24` con `-placement prefix` y con `-placement round-robin` compara TTFT y acierto de caché ([09 · Mediciones](09-fase-3-routing-por-prefijos.md#mediciones)).
 - **Cancelación:** con `-itl 1s` y un `curl` interrumpido se ve cómo `tokens_reserved` vuelve a 0 al instante.
+- **Resiliencia:** `task loadgen -- -chaos down` (o `hang`, `errors`, `stall`, `slow`, `restart`) rompe un worker durante la prueba; `/debug/workers` muestra su salud y su breaker, y `/debug/scheduler` los reintentos ([10 · Mediciones](10-fase-4-decisiones.md#mediciones-con-loadgen--chaos)).
 - **Concurrencia:** los tests lanzan cientos de goroutines contra un worker y verifican que no se pierde ni se sobrepasa capacidad (ver [07](07-concurrencia-y-tests.md)).
 
 ## Cómo hacerlo más realista (si hiciera falta)

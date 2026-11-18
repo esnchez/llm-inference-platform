@@ -1,6 +1,6 @@
 # Documentación del servicio
 
-Esta carpeta explica **cómo funciona la implementación actual** (Fases 1 a 3) de la plataforma: qué hace cada componente, cómo viaja una petición de principio a fin, por qué está diseñado así y qué relación tiene cada pieza con los workers reales de vLLM que la sustituirán.
+Esta carpeta explica **cómo funciona la implementación actual** (Fases 1 a 4) de la plataforma: qué hace cada componente, cómo viaja una petición de principio a fin, por qué está diseñado así y qué relación tiene cada pieza con los workers reales de vLLM que la sustituirán.
 
 El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitectura y el roadmap. Estos documentos bajan al nivel del código.
 
@@ -19,6 +19,7 @@ El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitec
 | 7 | [Concurrencia y tests](07-concurrencia-y-tests.md) | Goroutines, canales, locks, por qué no hay *data races* y qué cubre la suite de tests. |
 | 8 | [Fase 2: decisiones de diseño](08-fase-2-decisiones.md) | Las decisiones de la Fase 2 (cola, señal de capacidad, load shedding, tests), sus trade-offs y los conflictos resueltos. |
 | 9 | [Fase 3: routing por prefijos](09-fase-3-routing-por-prefijos.md) | Cómo se envía cada petición al worker que ya tiene su prefijo en la KV-Cache: hashes por bloque, radix tree, algoritmo de afinidad, caché simulada, decisiones y mediciones. |
+| 10 | [Fase 4: decisiones de diseño](10-fase-4-decisiones.md) | Resiliencia: registro de workers en caliente con drenaje, healthchecks, circuit breaker, workers degradados, reintento antes del primer token, clasificación de errores, fallos simulados y mediciones con caos. |
 
 ## Glosario rápido
 
@@ -30,6 +31,9 @@ El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitec
 | **Token budget** | Capacidad simulada de un worker, en tokens; representa la memoria de KV-Cache de la GPU. |
 | **Ledger** | Libro de cuentas de tokens reservados de cada worker en el control plane (`reserved` frente a `TokenBudget`). Cuenta reservas de peor caso, no la ocupación real de la GPU. Ver [03](03-leases-y-capacidad.md#el-ledger-de-capacidad). |
 | **Admisión / colocación** | Las dos mitades del scheduler (Fase 2): *cuándo* intentar (cola, timeouts, rechazo) y *dónde* (qué worker). Ver [08](08-fase-2-decisiones.md). |
+| **Breaker** | *Circuit breaker* por worker (cerrado / abierto / semiabierto). Lo abren fallos del worker o un healthcheck no sano; mientras está abierto, el worker no recibe peticiones nuevas. Ver [10 · Decisión 3](10-fase-4-decisiones.md#decisión-3-aislamiento-con-circuit-breaker-la-latencia-solo-desprioriza). |
+| **Degradado** | Worker cuya ITL supera 2× la mediana de los demás: solo se usa si los otros están llenos. |
+| **Drenaje** | Baja de un worker sin cortar sus streams: deja de recibir peticiones y desaparece cuando termina la última. |
 | **Dispatcher** | Goroutine única del scheduler que consume las señales `CapacityChanged()` de todos los workers y reintenta las colas cuando se libera capacidad. |
 | **Bloque de prefijo** | 16 tokens estimados (64 caracteres) del prompt. Es la unidad de la caché de prefijos, como el bloque de KV-Cache de vLLM. Ver [09](09-fase-3-routing-por-prefijos.md#decisión-1-qué-se-hashea). |
 | **Hash encadenado** | Hash de un bloque *y de todos los anteriores*: identifica el prefijo completo hasta ese bloque. Viaja en `InferenceRequest.PrefixHashes`. |

@@ -99,7 +99,9 @@ defer cancel()
 
 ### 4. Cabeceras
 
-Se envían `200` y:
+**Desde la Fase 4, las cabeceras esperan al primer chunk.** Hasta que llega el primer token, el lease del scheduler puede reintentar la petición en otro worker, y si todo falla el handler todavía puede responder con un código real: `503 worker_unavailable`, o `400` si el motor rechaza la petición al empezar. Así se resuelve **FI-9** ([10 · Decisión 4](10-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9)). Para el cliente apenas cambia nada: de todas formas no recibía nada útil antes del primer token.
+
+Con el primer chunk se envían `200` y:
 
 | Cabecera | Motivo |
 | :--- | :--- |
@@ -127,7 +129,8 @@ Cuando el canal se cierra, `wait()` devuelve el error de `ExecuteStream`:
 | :--- | :--- |
 | Éxito y `stream_options.include_usage: true` | Un chunk con `choices: []` y `usage` (`prompt_tokens` estimados, `completion_tokens` contados). |
 | Éxito | — |
-| Error con `ctx` vivo (fallo del worker) | `data: {"error": {...}}` *en banda*, porque el `200` ya se envió. |
+| Error antes del primer token (reintento incluido) | No hay stream: respuesta de error con su código (`503 worker_unavailable`, `400`, …) y sin `[DONE]`. |
+| Error con `ctx` vivo después del primer token | `data: {"error": {...}}` *en banda*, porque el `200` ya se envió. No se reintenta. |
 | Cancelación | Nada más (el cliente ya no está). |
 
 Si `ctx` sigue vivo, se termina con `data: [DONE]`, la señal estándar de fin de stream para clientes OpenAI.
@@ -143,6 +146,8 @@ Un único log por petición, con `request_id`, `model`, `worker_id`, `prompt_tok
 | Mensaje | Cuándo |
 | :--- | :--- |
 | `request rejected` | Falló la admisión (incluye `error`). |
+
+El `worker_id` del log es el del worker que terminó sirviendo la petición: si hubo un reintento, el segundo.
 | `request completed` | Stream completo. |
 | `request cancelled by client` | El cliente se desconectó. |
 | `request failed` | Error del worker (nivel `ERROR`). |

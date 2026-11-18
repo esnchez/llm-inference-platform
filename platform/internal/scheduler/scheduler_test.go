@@ -328,17 +328,25 @@ func TestModels(t *testing.T) {
 // invariants (no budget overrun, no leak, every request accounted for) must
 // not depend on where requests go.
 func TestStressInvariants(t *testing.T) {
-	t.Run("round-robin", func(t *testing.T) { stressInvariants(t, &RoundRobin{}) })
+	t.Run("round-robin", func(t *testing.T) { stressInvariants(t, &RoundRobin{}, false) })
 	t.Run("prefix-affinity", func(t *testing.T) {
 		p := NewPrefixAffinity(AffinityConfig{MinMatchBlocks: 1})
-		stressInvariants(t, p)
+		stressInvariants(t, p, false)
 		if st := p.Stats(); st.AffinityHits == 0 || st.Tree.Nodes == 0 {
 			t.Fatalf("prefix affinity never used: %+v", st)
 		}
 	})
+	// Phase 4: the same invariants while workers fail, hang, go down and
+	// restart at random, with health checks, breakers and retries on.
+	t.Run("chaos", func(t *testing.T) {
+		st := stressInvariants(t, NewPrefixAffinity(AffinityConfig{MinMatchBlocks: 1}), true)
+		if st.WorkerFailures == 0 || st.Retries == 0 || st.BreakerOpens == 0 {
+			t.Fatalf("the chaos never exercised the lifecycle: %+v", st)
+		}
+	})
 }
 
-func stressInvariants(t *testing.T, placement Placement) {
+func stressInvariants(t *testing.T, placement Placement, chaos bool) Stats {
 	const (
 		budget   = 300
 		requests = 1500
@@ -359,9 +367,44 @@ func stressInvariants(t *testing.T, placement Placement) {
 	}
 	// A deep queue (factor 50) so that most requests actually wait, pass each
 	// other and hit the barrier, instead of being shed on arrival.
-	s := New(Config{QueueTimeout: 2 * time.Second, HeadMaxAge: 20 * time.Millisecond, QueueTokenFactor: 50, SafetyPoll: 100 * time.Millisecond, Placement: placement}, workers...)
+	cfg := Config{QueueTimeout: 2 * time.Second, HeadMaxAge: 20 * time.Millisecond, QueueTokenFactor: 50, SafetyPoll: 100 * time.Millisecond, Placement: placement}
+	if chaos {
+		cfg.SafetyPoll = 5 * time.Millisecond
+		cfg.HealthInterval = 2 * time.Millisecond
+		cfg.BreakerFailures = 3
+		cfg.BreakerCooldown = 10 * time.Millisecond
+		cfg.TTFTTimeout = 30 * time.Millisecond
+		cfg.StallTimeout = 30 * time.Millisecond
+	}
+	s := New(cfg, workers...)
 
-	var ok, full, timedOut, cancelled, overBudget atomic.Int64
+	stopChaos := make(chan struct{})
+	chaosDone := make(chan struct{})
+	go func() {
+		defer close(chaosDone)
+		if !chaos {
+			return
+		}
+		faults := []simworker.Faults{{}, {}, {ErrorRate: 0.5}, {Down: true}, {Hang: true}, {StallAfterTokens: 3}, {FailAfterTokens: 2}, {Slowdown: 3}}
+		for {
+			select {
+			case <-stopChaos:
+				for _, w := range sims {
+					_ = w.SetFaults(simworker.Faults{})
+				}
+				return
+			case <-time.After(3 * time.Millisecond):
+			}
+			w := sims[rand.IntN(len(sims))]
+			if rand.IntN(10) == 0 {
+				w.Restart()
+			} else {
+				_ = w.SetFaults(faults[rand.IntN(len(faults))])
+			}
+		}
+	}()
+
+	var ok, full, timedOut, cancelled, noHealthy, failed, overBudget atomic.Int64
 	var wg sync.WaitGroup
 	for i := range requests {
 		wg.Add(1)
@@ -390,6 +433,9 @@ func stressInvariants(t *testing.T, placement Placement) {
 			case errors.Is(err, context.Canceled):
 				cancelled.Add(1)
 				return
+			case chaos && errors.Is(err, inference.ErrNoHealthyWorkers):
+				noHealthy.Add(1)
+				return
 			default:
 				t.Errorf("unexpected error: %v", err)
 				return
@@ -403,19 +449,25 @@ func stressInvariants(t *testing.T, placement Placement) {
 			chunks, wait := inference.StartStream(ctx, lease, 4)
 			for range chunks {
 			}
-			if err := wait(); err != nil && !errors.Is(err, context.Canceled) {
+			switch err := wait(); {
+			case chaos && errors.Is(err, inference.ErrWorkerFailure):
+				failed.Add(1)
+			case err != nil && !errors.Is(err, context.Canceled):
 				t.Errorf("stream: %v", err)
+			default:
+				ok.Add(1)
 			}
-			ok.Add(1)
 		}(i)
 	}
 	wg.Wait()
+	close(stopChaos)
+	<-chaosDone
 	s.Close()
 
 	if n := overBudget.Load(); n > 0 {
 		t.Fatalf("a worker exceeded its budget %d times", n)
 	}
-	if total := ok.Load() + full.Load() + timedOut.Load() + cancelled.Load(); total != requests {
+	if total := ok.Load() + full.Load() + timedOut.Load() + cancelled.Load() + noHealthy.Load() + failed.Load(); total != requests {
 		t.Fatalf("outcomes = %d, want %d", total, requests)
 	}
 	if ok.Load() == 0 {
@@ -434,6 +486,13 @@ func stressInvariants(t *testing.T, placement Placement) {
 	if st.AdmittedFromQueue == 0 {
 		t.Fatal("the stress test never exercised the queue")
 	}
-	t.Logf("ok=%d full=%d timeout=%d cancelled=%d admitted_from_queue=%d barrier_wakeups=%d p50=%.1fms p99=%.1fms",
-		ok.Load(), full.Load(), timedOut.Load(), cancelled.Load(), st.AdmittedFromQueue, st.BarrierWakeups, st.QueueWaitP50Ms, st.QueueWaitP99Ms)
+	for _, snap := range s.Snapshots() {
+		if snap.Status.InFlight != 0 {
+			t.Fatalf("grants never finished: %+v", snap.Status)
+		}
+	}
+	t.Logf("ok=%d full=%d timeout=%d cancelled=%d no_healthy=%d failed=%d admitted_from_queue=%d barrier_wakeups=%d retries=%d breaker_opens=%d p50=%.1fms p99=%.1fms",
+		ok.Load(), full.Load(), timedOut.Load(), cancelled.Load(), noHealthy.Load(), failed.Load(),
+		st.AdmittedFromQueue, st.BarrierWakeups, st.Retries, st.BreakerOpens, st.QueueWaitP50Ms, st.QueueWaitP99Ms)
+	return st
 }
