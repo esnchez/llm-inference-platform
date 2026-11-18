@@ -6,8 +6,11 @@
 // Traffic model: Poisson arrivals at -rate requests per second for
 // -duration; a -rag-fraction of long-context requests (long prompt, large
 // max_tokens) among short chat requests; and a -cancel-fraction of clients
-// that give up after a random delay. It compares queueing policies with the
-// simulator; llmperf takes over against real vLLM in Phase 6.
+// that give up after a random delay. With -prefixes N, chat requests start
+// with one of N long system prompts (uniform, or Zipf with -prefix-skew) to
+// exercise prefix-affinity routing (Phase 3); the report then adds the
+// workers' real prefix-cache hit rate. It compares scheduling policies with
+// the simulator; llmperf takes over against real vLLM in Phase 6.
 package main
 
 import (
@@ -49,6 +52,9 @@ func main() {
 		cancelFr  = flag.Float64("cancel-fraction", 0.05, "fraction of clients that give up early")
 		cancelMax = flag.Duration("cancel-max", 2*time.Second, "clients that give up do so after a uniform delay up to this")
 		seed      = flag.Uint64("seed", 1, "random seed (same seed, same traffic)")
+		prefixes  = flag.Int("prefixes", 0, "number of distinct system prompts shared by chat requests; 0 = no system prompt")
+		sysChars  = flag.Int("system-chars", 6000, "size of each system prompt, in characters (~4 per token)")
+		skew      = flag.Float64("prefix-skew", 0, "Zipf exponent (> 1) for choosing the system prompt, so a few are hot; 0 = uniform")
 	)
 	flag.Parse()
 	if *rate <= 0 || *duration <= 0 {
@@ -60,6 +66,17 @@ func main() {
 	client := &http.Client{}
 	chatPrompt := strings.Repeat("Hola, ¿qué tal? ", 12)
 	ragPrompt := strings.Repeat("contexto ", *ragChars/9+1)[:*ragChars]
+	systems := make([]string, *prefixes)
+	for i := range systems {
+		// Distinct from the first character, so they share no block.
+		head := fmt.Sprintf("Sistema %d. Eres el asistente número %d. ", i, i)
+		systems[i] = (head + strings.Repeat("Sigue estas instrucciones con cuidado. ", *sysChars/39+1))[:*sysChars]
+	}
+	pickSystem := func() int { return rng.IntN(len(systems)) }
+	if *skew > 1 && len(systems) > 1 {
+		z := rand.NewZipf(rng, *skew, 1, uint64(len(systems)-1))
+		pickSystem = func() int { return int(z.Uint64()) }
+	}
 
 	var (
 		mu       sync.Mutex
@@ -71,9 +88,11 @@ func main() {
 	for next := time.Duration(0); next < *duration; next += time.Duration(rng.ExpFloat64() / *rate * float64(time.Second)) {
 		time.Sleep(time.Until(start.Add(next)))
 		rag := rng.Float64() < *ragFrac
-		prompt, maxTokens := chatPrompt, *chatMax
+		system, prompt, maxTokens := "", fmt.Sprintf("Pregunta %d. %s", sent, chatPrompt), *chatMax
 		if rag {
 			prompt, maxTokens = ragPrompt, *ragMax
+		} else if len(systems) > 0 {
+			system = systems[pickSystem()]
 		}
 		var giveUp time.Duration
 		if rng.Float64() < *cancelFr {
@@ -83,7 +102,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			o := send(client, *url, *model, prompt, maxTokens, giveUp)
+			o := send(client, *url, *model, system, prompt, maxTokens, giveUp)
 			o.rag = rag
 			mu.Lock()
 			outcomes = append(outcomes, o)
@@ -93,20 +112,25 @@ func main() {
 	sendWindow := time.Since(start)
 	wg.Wait()
 	report(os.Stdout, outcomes, sent, sendWindow, time.Since(start))
+	printPrefixCache(os.Stdout, client, *url)
 	printSchedulerStats(os.Stdout, client, *url)
 }
 
-func send(client *http.Client, url, model, prompt string, maxTokens int, giveUp time.Duration) outcome {
+func send(client *http.Client, url, model, system, prompt string, maxTokens int, giveUp time.Duration) outcome {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if giveUp > 0 {
 		time.AfterFunc(giveUp, cancel)
 	}
+	messages := []map[string]string{{"role": "user", "content": prompt}}
+	if system != "" {
+		messages = append([]map[string]string{{"role": "system", "content": system}}, messages...)
+	}
 	body, _ := json.Marshal(map[string]any{
 		"model":      model,
 		"stream":     true,
 		"max_tokens": maxTokens,
-		"messages":   []map[string]string{{"role": "user", "content": prompt}},
+		"messages":   messages,
 	})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
@@ -190,6 +214,45 @@ func pct(ds []time.Duration, p float64) time.Duration {
 	s := slices.Clone(ds)
 	slices.Sort(s)
 	return s[int(p*float64(len(s)-1))].Round(time.Millisecond)
+}
+
+// printPrefixCache reports the workers' real prefix-cache hit rate (blocks
+// served from cache / blocks asked for), the ground truth that the router's
+// predicted_hit_rate in /debug/scheduler tries to match. Counters are
+// cumulative since the platform started.
+func printPrefixCache(w io.Writer, client *http.Client, url string) {
+	resp, err := client.Get(url + "/debug/workers")
+	if err != nil {
+		fmt.Fprintln(w, "/debug/workers:", err)
+		return
+	}
+	defer resp.Body.Close()
+	var workers []struct {
+		ID       string `json:"worker_id"`
+		Granted  uint64 `json:"leases_granted"`
+		Capacity int    `json:"prefix_cache_blocks"`
+		Used     int    `json:"prefix_cache_used"`
+		Queried  uint64 `json:"prefix_blocks_queried"`
+		Hit      uint64 `json:"prefix_blocks_hit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&workers); err != nil {
+		fmt.Fprintln(w, "/debug/workers:", err)
+		return
+	}
+	rate := func(hit, queried uint64) float64 {
+		if queried == 0 {
+			return 0
+		}
+		return 100 * float64(hit) / float64(queried)
+	}
+	var hit, queried uint64
+	fmt.Fprintln(w, "prefix cache (real, per worker, since start):")
+	for _, s := range workers {
+		hit, queried = hit+s.Hit, queried+s.Queried
+		fmt.Fprintf(w, "  %-14s leases %6d  cache %5d/%-5d blocks  hit rate %5.1f%%\n",
+			s.ID, s.Granted, s.Used, s.Capacity, rate(s.Hit, s.Queried))
+	}
+	fmt.Fprintf(w, "  %-14s %42s hit rate %5.1f%%\n\n", "total", "", rate(hit, queried))
 }
 
 func printSchedulerStats(w io.Writer, client *http.Client, url string) {

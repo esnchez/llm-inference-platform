@@ -34,10 +34,22 @@ func (p *RoundRobin) Place(ctx context.Context, req inference.InferenceRequest, 
 		return nil, inference.ErrAtCapacity
 	}
 	start := int(p.next.Add(1)-1) % n
-
-	var lastErr error
+	ordered := make([]inference.Worker, n)
 	for k := range n {
-		lease, err := workers[(start+k)%n].AcquireLease(ctx, req)
+		ordered[k] = workers[(start+k)%n]
+	}
+	return acquireFirst(ctx, req, ordered)
+}
+
+// acquireFirst tries the workers in order and returns the first lease
+// granted. Errors that no other worker can fix (cancelled context, invalid
+// request) stop the search; a full worker, one too small for the request or
+// a failing one moves on to the next. With no lease it returns
+// inference.ErrAtCapacity.
+func acquireFirst(ctx context.Context, req inference.InferenceRequest, ordered []inference.Worker) (inference.Lease, error) {
+	var lastErr error
+	for _, w := range ordered {
+		lease, err := w.AcquireLease(ctx, req)
 		switch {
 		case err == nil:
 			return lease, nil

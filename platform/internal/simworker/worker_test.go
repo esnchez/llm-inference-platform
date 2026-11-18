@@ -290,6 +290,7 @@ func TestNewRejectsNegativeRealismKnobs(t *testing.T) {
 	for i, mutate := range []func(*Config){
 		func(c *Config) { c.MeanOutputTokens = -1 },
 		func(c *Config) { c.ITLLoadFactor = -0.1 },
+		func(c *Config) { c.PrefixCacheBlocks = -1 },
 	} {
 		cfg := Config{ID: "w", Models: []string{model}, TokenBudget: 1}
 		mutate(&cfg)

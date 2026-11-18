@@ -61,7 +61,8 @@ type Config struct {
 	// up to MinRetryAfter of jitter, so that clients do not retry in sync.
 	MinRetryAfter time.Duration
 	MaxRetryAfter time.Duration
-	// Placement chooses the worker. Default: &RoundRobin{}.
+	// Placement chooses the worker. Default: &RoundRobin{}; cmd/platform
+	// uses NewPrefixAffinity (Phase 3).
 	Placement Placement
 }
 
@@ -438,6 +439,14 @@ type Stats struct {
 	QueueWaitP50Ms       float64      `json:"queue_wait_p50_ms"`
 	QueueWaitP99Ms       float64      `json:"queue_wait_p99_ms"`
 	Models               []ModelStats `json:"models"`
+	// Placement holds the placement policy's own counters when it has
+	// any (PrefixAffinity: AffinityStats).
+	Placement any `json:"placement,omitempty"`
+}
+
+// placementStatser is implemented by placements that expose counters.
+type placementStatser interface {
+	DebugStats() any
 }
 
 // ModelStats is the queue state of one model.
@@ -480,6 +489,10 @@ func (s *Scheduler) Stats() Stats {
 			ms.HeadAgeMs = now.Sub(m.queue[0].enqueued).Milliseconds()
 		}
 		st.Models = append(st.Models, ms)
+	}
+	if ps, ok := s.cfg.Placement.(placementStatser); ok {
+		// Same lock order as Place: s.mu, then the placement's own locks.
+		st.Placement = ps.DebugStats()
 	}
 	return st
 }

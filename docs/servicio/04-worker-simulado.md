@@ -7,12 +7,13 @@ El proyecto arranca sin GPU. `simworker.Worker` imita lo suficiente el comportam
 | Aspecto de una GPU con vLLM | Simulación | Fidelidad |
 | :--- | :--- | :--- |
 | Memoria de KV-Cache limitada | `TokenBudget` en tokens | Alta en concepto; ver diferencias en [06](06-relacion-con-vllm.md). |
-| Prefill del prompt (TTFT) | `BaseTTFT + PromptTokens × PrefillPerToken` | Aproximada: lineal en el tamaño del prompt. |
+| Prefill del prompt (TTFT) | `BaseTTFT + PrefillPerToken × tokens de prompt no cacheados` | Aproximada: lineal en el tamaño del prompt. |
+| *Prefix caching* (Fase 3) | LRU de bloques de 16 tokens identificados por `PrefixHashes`; solo se reutilizan los bloques iniciales consecutivos | Media: la caché es aparte del presupuesto (no compite con los leases) y no protege los bloques en uso. |
 | Decode (un token por paso) | `InterTokenLatency × (1 + ITLLoadFactor × (leases activos − 1))` | Media: la ITL crece con la carga, de forma lineal e inventada (se calibra en la Fase 6). |
 | Abortar una petición y liberar sus bloques | `ctx.Done()` → retorno inmediato → liberación | Alta. |
 | Longitud de salida | Exponencial con media `MeanOutputTokens`, acotada por `MaxNewTokens` y determinista por ID; `finish_reason: stop` si para antes | Media: la forma de la distribución es una suposición. |
 | Contenido | Palabras falsas deterministas | Irrelevante para el control plane. |
-| *Continuous batching*, *preemption*, *prefix caching* | No se simulan | — |
+| *Continuous batching*, *preemption* | No se simulan | — |
 
 ## Configuración
 
@@ -27,12 +28,13 @@ type Config struct {
     LeaseTTL          time.Duration // 0 = sin expiración
     MeanOutputTokens  int           // media de la salida; 0 = siempre MaxNewTokens
     ITLLoadFactor     float64       // crecimiento de la ITL por lease activo extra; 0 = constante
+    PrefixCacheBlocks int           // caché de prefijos, en bloques de 16 tokens; 0 = sin caché
 }
 ```
 
-`New` valida que haya `ID`, al menos un modelo, `TokenBudget > 0`, duraciones no negativas y que `MeanOutputTokens` e `ITLLoadFactor` no sean negativos. Estos dos valen 0 por defecto (el comportamiento de la Fase 1, que usan los tests de contrato); el binario los activa con `-mean-output-tokens 200` e `-itl-load-factor 0.05`.
+`New` valida que haya `ID`, al menos un modelo, `TokenBudget > 0`, duraciones no negativas y que `MeanOutputTokens`, `ITLLoadFactor` y `PrefixCacheBlocks` no sean negativos. Los tres valen 0 por defecto (el comportamiento de la Fase 1, que usan los tests de contrato); el binario los activa con `-mean-output-tokens 200`, `-itl-load-factor 0.05` y `-prefix-cache-blocks` (por defecto `token-budget/16`, es decir, 1.024 bloques).
 
-Con los valores por defecto del binario (`ttft=50ms`, `prefill-per-token=20µs`, `itl=20ms`), un solo lease activo y contando los tokens realmente generados:
+Con los valores por defecto del binario (`ttft=50ms`, `prefill-per-token=20µs`, `itl=20ms`), un solo lease activo, sin prefijo cacheado y contando los tokens realmente generados:
 
 | Petición | TTFT | Duración total aproximada |
 | :--- | :--- | :--- |
@@ -47,7 +49,9 @@ Esto refleja una realidad de los LLMs: el **prompt** encarece sobre todo la late
 ```text
 begin()                         → valida el estado del lease, para el TTL
 defer Release()                 → libera tokens al salir, pase lo que pase
-ttft = BaseTTFT + PromptTokens × PrefillPerToken
+cached = min(bloques iniciales de PrefixHashes ya en caché × 16, PromptTokens)
+          → y todos los bloques de la petición pasan a ser los más recientes
+ttft = BaseTTFT + (PromptTokens − cached) × PrefillPerToken
 n = outputTokens(semilla, MaxNewTokens)    → MaxNewTokens si MeanOutputTokens = 0
 para i en 0 .. n-1:
     espera (i == 0 ? ttft : ITL según la carga) ┐ ambos con select sobre ctx.Done():
@@ -62,19 +66,34 @@ Detalles:
 - Si una pausa es 0 (por ejemplo en tests), no se crea espera, pero se sigue comprobando `ctx.Err()` en cada token.
 - El texto sale de un vocabulario de 16 palabras, indexado a partir de un hash FNV del ID de la petición: la misma petición produce siempre el mismo texto, lo que facilita depurar. La longitud de salida usa la misma semilla, así que también es reproducible.
 - La ITL se recalcula en cada token leyendo los leases activos bajo el mutex del worker.
+- La caché de prefijos tiene su propio mutex, separado del del ledger: consultarla no bloquea `AcquireLease`.
 - Al liberar la reserva (`free`), el worker emite `CapacityChanged()` con un envío no bloqueante sobre un canal de buffer 1: muchas liberaciones seguidas producen una sola señal.
+
+## Caché de prefijos (Fase 3)
+
+Imita el *automatic prefix caching* de vLLM, lo justo para medir el router por prefijos ([09 · Decisión 7](09-fase-3-routing-por-prefijos.md#decisión-7-caché-de-prefijos-en-el-simulador)):
+
+- **Unidad:** bloques de 16 tokens estimados, identificados por los hashes encadenados que calcula el control plane (`InferenceRequest.PrefixHashes`). El worker no hashea nada.
+- **Solo prefijos:** cuenta los bloques cacheados **desde el principio** hasta el primer fallo. Un bloque cacheado después de un fallo no sirve, porque su KV depende de todos los anteriores.
+- **LRU con el prefijo protegido:** la petición toca sus bloques del último al primero. Así los primeros, los que comparten otras peticiones, quedan como los más recientes y se expulsan los últimos (vLLM libera los bloques de una petición en orden inverso por la misma razón).
+- **Fuera del presupuesto:** la caché no descuenta tokens del ledger ni compite con los leases. En vLLM la caché vive en la KV libre, así que el simulador es optimista en ese punto (FI-1).
+- **Contadores** en `Snapshot()` y `/debug/workers`: `prefix_cache_blocks` (capacidad), `prefix_cache_used`, `prefix_blocks_queried` y `prefix_blocks_hit`. Su cociente es el acierto **real**, que se compara con el que predice el router.
+
+Con `-prefill-per-token 100us`, un *system prompt* de 1.500 tokens cuesta 150 ms de prefill la primera vez en cada worker y 0 las siguientes.
 
 ## Lo que el simulador permite validar hoy
 
 - **Admisión y cola:** con presupuestos pequeños (`-token-budget 600`) las peticiones esperan en la cola; `/debug/scheduler` muestra la espera y los `503` por cola llena o timeout. `task loadgen` genera tráfico realista para comparar configuraciones.
-- **Reparto:** `/debug/workers` muestra cómo el round-robin reparte leases (`leases_granted`, `leases_rejected`).
+- **Reparto:** `/debug/workers` muestra cómo la colocación reparte leases (`leases_granted`, `leases_rejected`).
+- **Routing por prefijos:** `task loadgen -- -prefixes 24` con `-placement prefix` y con `-placement round-robin` compara TTFT y acierto de caché ([09 · Mediciones](09-fase-3-routing-por-prefijos.md#mediciones)).
 - **Cancelación:** con `-itl 1s` y un `curl` interrumpido se ve cómo `tokens_reserved` vuelve a 0 al instante.
 - **Concurrencia:** los tests lanzan cientos de goroutines contra un worker y verifican que no se pierde ni se sobrepasa capacidad (ver [07](07-concurrencia-y-tests.md)).
 
 ## Cómo hacerlo más realista (si hiciera falta)
 
-Las dos primeras se implementaron en la Fase 2 ([08 · Decisión 1](08-fase-2-decisiones.md#decisión-1-realismo-del-worker-simulado)) y están descritas arriba: sin ellas, ninguna política de cola se podía evaluar. La tercera será necesaria para la Fase 3.
+Las dos primeras se implementaron en la Fase 2 ([08 · Decisión 1](08-fase-2-decisiones.md#decisión-1-realismo-del-worker-simulado)): sin ellas, ninguna política de cola se podía evaluar. La tercera se implementó en la Fase 3 (ver [arriba](#caché-de-prefijos-fase-3)). Las tres están descritas en este documento.
 
 - **Salida de longitud variable** (parar antes de `MaxNewTokens` con `finish_reason: stop`): haría visible la infrautilización de la reserva pesimista (FI-1), hoy oculta porque reserva y uso coinciden.
 - **ITL dependiente de la carga** (por ejemplo `ITL × (1 + α·leases_activos)`): imitaría el efecto del *continuous batching*, donde más peticiones simultáneas suben el throughput total pero empeoran la latencia de cada una.
-- **Caché de prefijos simulada:** reducir el TTFT si el prefijo ya se vio en ese worker. Será necesario para medir el router por prefijos de la Fase 3 sin GPU.
+- **Caché de prefijos simulada:** reducir el TTFT si el prefijo ya se vio en ese worker. Hacía falta para medir el router por prefijos de la Fase 3 sin GPU.
+- **Pendiente, si hiciera falta:** que la caché comparta memoria con el presupuesto (los bloques cacheados ocupan sitio y se expulsan cuando una petición nueva lo necesita), como en vLLM. Va ligado a FI-1.

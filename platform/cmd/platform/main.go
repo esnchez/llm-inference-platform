@@ -16,6 +16,7 @@ import (
 
 	"llm-inference-platform/internal/httpapi"
 	"llm-inference-platform/internal/inference"
+	"llm-inference-platform/internal/prefix"
 	"llm-inference-platform/internal/scheduler"
 	"llm-inference-platform/internal/simworker"
 )
@@ -44,6 +45,10 @@ func run() error {
 		queueFactor   = flag.Float64("queue-token-factor", 2, "per-model queue limit, as a multiple of the model's total token budget")
 		maxQueued     = flag.Int("max-queued", 1024, "max waiting requests across all models")
 		maxTokens     = flag.Int("max-tokens-limit", 4096, "largest max_tokens accepted from clients")
+		placement     = flag.String("placement", "prefix", "worker choice: prefix (KV-cache prefix affinity) or round-robin")
+		affinityLoad  = flag.Float64("affinity-max-load", 0.8, "ledger load above which a worker stops getting requests for prefix affinity alone")
+		affinityMin   = flag.Int("affinity-min-blocks", 4, "shortest cached prefix that counts as affinity, in blocks of 16 tokens")
+		prefixCache   = flag.Int("prefix-cache-blocks", -1, "simulated prefix cache per worker, in blocks of 16 tokens; -1 = token-budget/16, 0 = disabled")
 		shutdownGrace = flag.Duration("shutdown-grace", 15*time.Second, "time given to in-flight streams on shutdown")
 	)
 	flag.Parse()
@@ -52,6 +57,10 @@ func run() error {
 	slog.SetDefault(log)
 
 	modelList := strings.Split(*models, ",")
+	cacheBlocks := *prefixCache
+	if cacheBlocks < 0 {
+		cacheBlocks = *budget / prefix.BlockTokens
+	}
 	workers := make([]inference.Worker, 0, *numWorkers)
 	for i := 0; i < *numWorkers; i++ {
 		w, err := simworker.New(simworker.Config{
@@ -64,11 +73,25 @@ func run() error {
 			LeaseTTL:          *leaseTTL,
 			MeanOutputTokens:  *meanOutput,
 			ITLLoadFactor:     *itlLoad,
+			PrefixCacheBlocks: cacheBlocks,
 		})
 		if err != nil {
 			return err
 		}
 		workers = append(workers, w)
+	}
+
+	var place scheduler.Placement
+	switch *placement {
+	case "prefix":
+		place = scheduler.NewPrefixAffinity(scheduler.AffinityConfig{
+			MaxLoad:        *affinityLoad,
+			MinMatchBlocks: *affinityMin,
+		})
+	case "round-robin":
+		place = &scheduler.RoundRobin{}
+	default:
+		return fmt.Errorf("unknown -placement %q (want prefix or round-robin)", *placement)
 	}
 
 	cfg := httpapi.DefaultConfig()
@@ -78,6 +101,7 @@ func run() error {
 		HeadMaxAge:        *headMaxAge,
 		QueueTokenFactor:  *queueFactor,
 		MaxQueuedRequests: *maxQueued,
+		Placement:         place,
 	}, workers...)
 	defer sched.Close()
 	api := httpapi.New(sched, cfg, log)
@@ -94,7 +118,8 @@ func run() error {
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("platform listening", "addr", *addr, "workers", *numWorkers, "models", modelList, "token_budget", *budget)
+		log.Info("platform listening", "addr", *addr, "workers", *numWorkers, "models", modelList,
+			"token_budget", *budget, "placement", *placement, "prefix_cache_blocks", cacheBlocks)
 		errc <- srv.ListenAndServe()
 	}()
 

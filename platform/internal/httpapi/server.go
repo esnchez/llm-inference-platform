@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"llm-inference-platform/internal/inference"
+	"llm-inference-platform/internal/prefix"
 	"llm-inference-platform/internal/tokens"
 )
 
@@ -365,6 +366,9 @@ func (s *Server) toInferenceRequest(body chatRequest) (inference.InferenceReques
 		Prompt:       prompt,
 		PromptTokens: tokens.Estimate(prompt),
 		MaxNewTokens: maxTokens,
+		// Hashed once here; the scheduler may try to place the request
+		// many times while it waits in the queue.
+		PrefixHashes: prefix.Hashes(body.Model, prompt),
 	}, nil
 }
 

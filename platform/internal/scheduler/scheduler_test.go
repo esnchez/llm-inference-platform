@@ -324,7 +324,21 @@ func TestModels(t *testing.T) {
 // with clients that cancel, and checks the invariants once everything ends:
 // no worker ever exceeds its budget, no capacity is lost, the queues are
 // empty, every request got exactly one outcome and no goroutine leaked.
+// TestStressInvariants runs the same storm with both placements: the
+// invariants (no budget overrun, no leak, every request accounted for) must
+// not depend on where requests go.
 func TestStressInvariants(t *testing.T) {
+	t.Run("round-robin", func(t *testing.T) { stressInvariants(t, &RoundRobin{}) })
+	t.Run("prefix-affinity", func(t *testing.T) {
+		p := NewPrefixAffinity(AffinityConfig{MinMatchBlocks: 1})
+		stressInvariants(t, p)
+		if st := p.Stats(); st.AffinityHits == 0 || st.Tree.Nodes == 0 {
+			t.Fatalf("prefix affinity never used: %+v", st)
+		}
+	})
+}
+
+func stressInvariants(t *testing.T, placement Placement) {
 	const (
 		budget   = 300
 		requests = 1500
@@ -345,7 +359,7 @@ func TestStressInvariants(t *testing.T) {
 	}
 	// A deep queue (factor 50) so that most requests actually wait, pass each
 	// other and hit the barrier, instead of being shed on arrival.
-	s := New(Config{QueueTimeout: 2 * time.Second, HeadMaxAge: 20 * time.Millisecond, QueueTokenFactor: 50, SafetyPoll: 100 * time.Millisecond}, workers...)
+	s := New(Config{QueueTimeout: 2 * time.Second, HeadMaxAge: 20 * time.Millisecond, QueueTokenFactor: 50, SafetyPoll: 100 * time.Millisecond, Placement: placement}, workers...)
 
 	var ok, full, timedOut, cancelled, overBudget atomic.Int64
 	var wg sync.WaitGroup
@@ -361,7 +375,9 @@ func TestStressInvariants(t *testing.T) {
 					cancel()
 				}()
 			}
-			r := inference.InferenceRequest{ID: fmt.Sprint(i), Model: "m", PromptTokens: 1 + rand.IntN(60), MaxNewTokens: 1 + rand.IntN(40)}
+			r := inference.InferenceRequest{ID: fmt.Sprint(i), Model: "m", PromptTokens: 1 + rand.IntN(60), MaxNewTokens: 1 + rand.IntN(40),
+				// Five shared "system prompts" with a private tail.
+				PrefixHashes: []uint64{uint64(rand.IntN(5)), uint64(1000 + i)}}
 			lease, err := s.Acquire(ctx, r)
 			switch {
 			case err == nil:

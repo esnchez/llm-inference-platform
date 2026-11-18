@@ -8,11 +8,11 @@ El objetivo final es que cada worker sea un servidor **vLLM** con una GPU. Este 
 
 | Responsabilidad | Plataforma (control plane, Go) | vLLM (data plane, por GPU) |
 | :--- | :--- | :--- |
-| Elegir a qué GPU va cada petición | ✅ `scheduler` (hoy round-robin; Fase 3 por prefijos) | ❌ solo conoce su propia GPU |
+| Elegir a qué GPU va cada petición | ✅ `scheduler` (afinidad de prefijo desde la Fase 3; round-robin opcional) | ❌ solo conoce su propia GPU |
 | Rechazar pronto cuando el clúster está lleno (`503`) | ✅ leases + admisión | ⚠️ encola internamente sin límite útil para el cliente |
 | Agrupar peticiones en batches (*continuous batching*) | ❌ | ✅ |
 | Gestionar la memoria KV-Cache por bloques (*PagedAttention*) | ❌ solo la contabiliza (aproximadamente) | ✅ |
-| Reutilizar prefijos ya calculados (*prefix caching*) | Fase 3: enviar la petición al worker que ya los tiene | ✅ dentro de su GPU |
+| Reutilizar prefijos ya calculados (*prefix caching*) | ✅ Fase 3: enviar la petición al worker que ya los tiene (radix tree aproximado) | ✅ dentro de su GPU |
 | Tokenizar y aplicar la *chat template* del modelo | ❌ hoy solo estima (FI-3) | ✅ |
 | Abortar y liberar memoria al cancelar | ✅ propaga la cancelación | ✅ libera los bloques |
 | Kernels CUDA, ejecución del modelo | ❌ (no objetivo) | ✅ |
@@ -30,6 +30,8 @@ En una frase: **vLLM optimiza una GPU; la plataforma optimiza el clúster de GPU
 | `ActiveLeases` | `vllm:num_requests_running` (+ `vllm:num_requests_waiting`). |
 | TTFT simulado (`BaseTTFT + prompt × PrefillPerToken`) | Fase de *prefill*: el modelo procesa todo el prompt en paralelo y llena la KV-Cache. |
 | ITL simulada | Fase de *decode*: un paso del modelo por token, compartido con todo el batch. |
+| `PrefixHashes` + caché de `simworker` (Fase 3) | *Automatic prefix caching* (`--enable-prefix-caching`, activo por defecto en V1): bloques de `--block-size` tokens identificados por un hash del bloque y de su prefijo. vLLM hashea IDs de token tras la *chat template*; nosotros, texto aplanado. |
+| `prefix.Tree` en el router | No existe en vLLM: es la vista del clúster que ninguna GPU tiene. |
 | `ctx.Done()` → liberación | Al cerrar la conexión HTTP, el servidor de vLLM aborta la petición y libera sus bloques. |
 | `AcquireLease` atómico | **No existe en vLLM.** Ver abajo. |
 | `ErrAtCapacity` | No hay equivalente directo: vLLM acepta y encola, o expulsa (*preempt*) peticiones si se queda sin bloques. |
@@ -37,7 +39,7 @@ En una frase: **vLLM optimiza una GPU; la plataforma optimiza el clúster de GPU
 ## Lo que la simulación no captura (y por qué importa)
 
 1. **vLLM no reserva el peor caso.** Asigna bloques a medida que la secuencia crece. Si se queda sin memoria, expulsa peticiones en curso (las recalcula más tarde), lo que dispara la latencia. Nuestra reserva pesimista evita llegar a ese punto, a costa de admitir menos de lo que cabría (**FI-1**).
-2. **El prefix caching hace que el coste real sea menor que el contabilizado.** Si 50 peticiones comparten un *system prompt* de 2000 tokens, vLLM guarda esos bloques una sola vez; nosotros los contamos 50 veces (**FI-1**, y clave para la Fase 3).
+2. **El prefix caching hace que el coste real sea menor que el contabilizado.** Si 50 peticiones comparten un *system prompt* de 2000 tokens, vLLM guarda esos bloques una sola vez; nosotros los contamos 50 veces (**FI-1**). Con el routing por afinidad de la Fase 3 esas peticiones se concentran en el mismo worker, así que la sobrestimación es mayor ([09 · Interacción con FI-1](09-fase-3-routing-por-prefijos.md#interacción-con-fi-1-la-reserva-pesimista)).
 3. **La ITL depende del batch.** Con más peticiones simultáneas, cada paso de decode sirve a más secuencias: sube el throughput total pero cada petición va más lenta. El simulador usa una ITL fija (ver [04](04-worker-simulado.md)).
 4. **Los tokens reales salen del tokenizer del modelo**, no de "4 caracteres por token" (**FI-3**).
 
@@ -100,7 +102,8 @@ Son consecuencias del contrato de la Fase 1 que conviene resolver antes de, o du
 1. **`InferenceRequest` solo lleva el prompt aplanado.** `renderPrompt` convierte los mensajes en `role: content\n` únicamente para estimar el coste. vLLM necesita los `messages` originales para aplicar la *chat template* del modelo, y también los parámetros de muestreo que hoy se ignoran (`temperature`, `top_p`, `stop`, …). El contrato tendrá que transportar los mensajes y esos parámetros, o el cuerpo original de la petición (**FI-7**).
 2. **Un `TokenChunk` no siempre es exactamente un token.** vLLM normalmente emite un token por evento, pero puede agrupar varios (por ejemplo, al retener bytes de un carácter UTF-8 incompleto, o con *speculative decoding*). Hoy `completion_tokens` se calcula contando chunks; con vLLM debería tomarse del `usage` que devuelve el propio motor (**FI-8**).
 3. **Las cabeceras `200` se envían antes de que el worker responda.** Con el simulador no importa, pero vLLM puede rechazar la petición al empezar (por ejemplo, `prompt + max_tokens` mayor que `--max-model-len` según su tokenizer real, que puede no coincidir con nuestra estimación). Con el diseño actual ese rechazo llegaría como error *en banda* dentro de un stream `200`. Una alternativa es esperar al primer chunk (o a la primera respuesta de vLLM) antes de escribir las cabeceras, a costa de complicar el handler (**FI-9**).
-4. **El `finish_reason` real** puede ser `stop` (fin natural, *stop sequence*) además de `length`; el tipo `FinishReason` ya lo contempla.
+4. **`PrefixHashes` no le sirve a vLLM.** El adaptador no lo enviará: vLLM calcula sus propios hashes sobre los tokens reales. El router seguirá usándolos para su árbol. Hay que comprobar que la *chat template* del modelo no inserta texto variable al principio del prompt (fechas, IDs), porque rompería en vLLM prefijos que el router cree compartidos ([09 · Limitaciones](09-fase-3-routing-por-prefijos.md#limitaciones-y-trabajo-futuro)).
+5. **El `finish_reason` real** puede ser `stop` (fin natural, *stop sequence*) además de `length`; el tipo `FinishReason` ya lo contempla.
 
 ## Por qué el diseño actual sigue siendo válido con vLLM
 

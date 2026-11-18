@@ -16,8 +16,8 @@ Solo se implementa el subconjunto que el control plane necesita hoy.
 | :--- | :--- |
 | `POST /v1/chat/completions` | Inferencia. SSE si `stream: true`; JSON si no. |
 | `GET /v1/models` | `{"object":"list","data":[{"id":"sim-llama-3-8b","object":"model","owned_by":"llm-inference-platform"}]}` |
-| `GET /debug/workers` | Array de `WorkerSnapshot` (presupuesto, reservado, leases activos, concedidos, rechazados). |
-| `GET /debug/scheduler` | Estado de la admisión: peticiones y tokens en cola por modelo, límite de la cola, edad de la cabeza, admitidas (directas y desde la cola), rechazos por motivo, despertares con barrera y tiempo en cola p50/p99. |
+| `GET /debug/workers` | Array de `WorkerSnapshot` (presupuesto, reservado, leases activos, concedidos, rechazados y, con caché de prefijos, `prefix_cache_blocks`, `prefix_cache_used`, `prefix_blocks_queried` y `prefix_blocks_hit`). |
+| `GET /debug/scheduler` | Estado de la admisión: peticiones y tokens en cola por modelo, límite de la cola, edad de la cabeza, admitidas (directas y desde la cola), rechazos por motivo, despertares con barrera y tiempo en cola p50/p99. Con `-placement prefix`, un bloque `placement` con los contadores de afinidad y el tamaño del radix tree ([09 · Métricas](09-fase-3-routing-por-prefijos.md#métricas)). |
 | `GET /healthz` | `200 ok` (liveness). |
 
 Las rutas usan los patrones con método de `net/http` (Go ≥ 1.22): un `GET` a `/v1/chat/completions` devuelve `405` automáticamente.
@@ -148,4 +148,10 @@ curl -s localhost:8080/debug/scheduler
 
 # Carga realista (Poisson, chat + RAG, cancelaciones) y resumen de resultados
 task loadgen -- -rate 30 -duration 10s
+
+# Routing por prefijos: 24 system prompts compartidos (añadir -prefix-skew 1.5 para unos pocos calientes).
+# Comparar con el servidor arrancado con -placement prefix y con -placement round-robin.
+task loadgen -- -rate 4 -duration 60s -prefixes 24 -rag-fraction 0 -cancel-fraction 0
 ```
+
+Los mensajes `system` cuentan para el prefijo igual que el resto: el prompt se aplana en orden (`role: content\n`) y se hashea por bloques de 64 caracteres. Dos peticiones con el mismo `system` (y el mismo modelo) comparten todos los bloques completos de ese mensaje.

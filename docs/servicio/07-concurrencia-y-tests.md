@@ -58,7 +58,7 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | :--- | :--- |
 | `task check` | En cada cambio: `gofmt` + `go vet` + tests. |
 | `task check:all` | Antes de cerrar una fase: `check` + tests con `-race` en Docker. |
-| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2: `scheduler` 90 %, `simworker` 96 %, `httpapi` 86 %). |
+| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %). |
 | `task loadgen` | Generador de carga contra un servidor en marcha (no es un test: sirve para comparar configuraciones). |
 
 ### `internal/simworker` — contrato del lease
@@ -79,6 +79,10 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | `TestVariableOutputLength` | Salida entre 1 y `max_tokens`, `stop` si para antes y `length` si llega al tope, reproducible por ID. |
 | `TestITLGrowsWithLoad` | La ITL crece según `ITLLoadFactor` con los leases activos. |
 | `TestCapacityChangedSignal` | La señal se emite al liberar, al terminar un stream y al vencer el TTL, y se agrupa. |
+| `TestPrefixCacheMatchesLeadingBlocksOnly` | Solo cuentan los bloques iniciales consecutivos; contadores de consulta y acierto. |
+| `TestPrefixCacheEvictsTailsBeforeSharedHeads` | La LRU expulsa las colas de las peticiones antes que el prefijo compartido. |
+| `TestPrefixCacheShortensTTFT` | Un prompt de 800 tokens ya cacheado se salta el prefill; `Snapshot` refleja tamaño y aciertos. |
+| `TestNoPrefixCacheByDefault` | Sin `PrefixCacheBlocks`, los hashes se ignoran (comportamiento de las fases 1 y 2). |
 
 ### `internal/scheduler` — admisión, cola y colocación
 
@@ -98,7 +102,35 @@ Los tests usan un sondeo de seguridad de 1 hora, así que demuestran que es la s
 | `TestClientDeadlineCapsTheWait` | El deadline del cliente acota la espera. |
 | `TestCancelWhileQueued` | Cancelar en la cola no reserva nada ni deja restos. |
 | `TestModels` | Lista de modelos ordenada y sin duplicados. |
-| `TestStressInvariants` | 1.500 peticiones contra 3 workers realistas, con cancelaciones: nunca se supera el presupuesto, cada petición tiene un único resultado, la cola y los ledgers acaban vacíos y no quedan goroutines. |
+| `TestStressInvariants` | 1.500 peticiones contra 3 workers realistas, con cancelaciones: nunca se supera el presupuesto, cada petición tiene un único resultado, la cola y los ledgers acaban vacíos y no quedan goroutines. Se ejecuta con las dos colocaciones (`round-robin` y `prefix-affinity`, esta con 5 prefijos compartidos). |
+
+`affinity_test.go` (Fase 3):
+
+| Test | Qué garantiza |
+| :--- | :--- |
+| `TestAffinityKeepsAPrefixOnOneWorker` | Las peticiones con el mismo prefijo van al mismo worker; contadores de acierto y bloques previstos. |
+| `TestAffinitySpreadsDifferentPrefixesByLoad` | Prefijos nuevos se reparten por carga entre workers ociosos. |
+| `TestAffinityPrefersTheLongestMatch` | Gana el worker con el prefijo más largo, aunque esté más cargado (por debajo de `MaxLoad`). |
+| `TestAffinityIgnoresShortMatches` | Un acierto menor que `MinMatchBlocks` no se impone a la carga. |
+| `TestAffinityOverflowsWhenTheWorkerIsLoaded` | Por encima de `MaxLoad` la petición desborda al menos cargado, que pasa a tener el prefijo y recibe los siguientes. |
+| `TestAffinityFallsBackWhenTheAffineWorkerIsFull` | Si la petición no cabe en el worker afín, va al siguiente y cuenta como desbordamiento. |
+| `TestAffinityWithoutPrefixUsesLoad` | Sin hashes: el menos cargado, y el árbol no se toca. |
+| `TestAffinityErrors` | Sin workers o con el pool lleno → `ErrAtCapacity`; un contexto cancelado se propaga; los fallos no se registran. |
+| `TestSchedulerWithAffinity` | Integración con la cola: una petición en espera entra por desbordamiento al liberarse capacidad, y los contadores llegan a `Stats().Placement`. |
+
+### `internal/prefix` — hashes y radix tree
+
+| Test | Qué garantiza |
+| :--- | :--- |
+| `TestHashesCutsFullBlocksOnly` | Un hash por bloque completo de 64 caracteres; el bloque parcial no cuenta. |
+| `TestHashesCountRunesNotBytes` | Los bloques se cortan por caracteres, como `tokens.Estimate`. |
+| `TestHashesAreChained` | Prompts que comparten *k* bloques comparten *k* hashes y después difieren; los hashes dependen de la posición y del modelo y son deterministas. |
+| `TestTreeMatchAndSplit` | Coincidencia por worker, incluida la parcial dentro de una arista, y partición de aristas. |
+| `TestTreeInsertIsIdempotent` | Reinsertar no duplica bloques. |
+| `TestTreeEvictsLeastRecentlyUsedDeepestFirst` | La expulsión quita las hojas menos usadas de ese worker (nodos enteros) y respeta el prefijo compartido refrescado. |
+| `TestTreeRemoveWorker` | Olvidar un worker borra sus nodos exclusivos y deja los compartidos. |
+| `TestTreeRandomized` | 3.000 inserciones aleatorias con prefijos compartidos: invariantes del árbol, cota de capacidad por worker y coincidencia completa tras insertar. |
+| `TestTreeConcurrentUse` | 8 goroutines insertando y consultando a la vez (con `-race`). |
 
 ### `internal/httpapi` — de extremo a extremo con `httptest`
 
@@ -112,13 +144,16 @@ Usan workers simulados reales detrás de un servidor HTTP real:
 | `TestQueuedRequestCompletesAfterCapacityIsFreed` | Una petición espera en la cola, entra al liberarse capacidad (con TTL activo) y su stream termina; `/debug/scheduler` lo refleja. |
 | `TestClientDisconnectReleasesCapacity` | Una desconexión del cliente a mitad de stream libera la capacidad. |
 | `TestModelsAndDebugEndpoints` | `/v1/models` y `/debug/workers`. |
+| `TestRequestsCarryPrefixHashes` | Dos chats con el mismo `system` comparten los hashes de sus bloques; los mensajes distintos acaban en bloques distintos; un prompt corto no lleva hashes. |
 
 ### Huecos conocidos
 
 - `internal/tokens` no tiene tests (0 % de cobertura).
+- La comparación de colocaciones (TTFT, acierto de caché) se mide con `loadgen` contra el binario, no con un test: depende de tiempos reales.
+- `PrefixAffinity.RemoveWorker` no tiene test propio (lo cubre `TestTreeRemoveWorker`) y nadie lo llama hasta la Fase 4.
 - La comprobación del pico de reserva sigue siendo por muestreo (después de cada concesión), tanto en `simworker` como en el test de estrés del scheduler.
 - La prueba del binario completo (arrancarlo y lanzar peticiones con `curl`) se hizo a mano; un test *end-to-end* en Go que arranque el servidor sería la forma portable de automatizarla.
 - No hay un test que fuerce el vencimiento del TTL *después* de salir de la cola; el camino normal (cola → handler con TTL activo) sí está cubierto.
-- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
+- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
 
 La estrategia de tests de la Fase 2 (contrato, estrés con invariantes y generador de carga) está en [08 · Decisión 7](08-fase-2-decisiones.md#decisión-7-tests-carga-y-métricas-mínimas).

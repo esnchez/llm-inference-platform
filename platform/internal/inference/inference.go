@@ -71,6 +71,12 @@ type InferenceRequest struct {
 	PromptTokens int
 	// MaxNewTokens is the upper bound of generated tokens.
 	MaxNewTokens int
+	// PrefixHashes are the chained hashes of the prompt's full blocks
+	// (prefix.Hashes, prefix.BlockTokens tokens each). The control plane
+	// uses them to route by prefix affinity (Phase 3); a worker with a
+	// prefix cache may use them to skip the prefill of cached blocks. Nil
+	// disables both.
+	PrefixHashes []uint64
 }
 
 // TokenCost is the capacity a request reserves on a worker: its input tokens
@@ -98,6 +104,13 @@ type WorkerSnapshot struct {
 	ActiveLeases   int      `json:"active_leases"`
 	LeasesGranted  uint64   `json:"leases_granted"`
 	LeasesRejected uint64   `json:"leases_rejected"`
+	// Prefix cache (Phase 3), the worker's own ground truth. Zero when the
+	// worker has no prefix cache. PrefixBlocksHit / PrefixBlocksQueried is
+	// the real cache hit rate, to compare with the router's prediction.
+	PrefixCacheBlocks   int    `json:"prefix_cache_blocks,omitempty"`
+	PrefixCacheUsed     int    `json:"prefix_cache_used,omitempty"`
+	PrefixBlocksQueried uint64 `json:"prefix_blocks_queried,omitempty"`
+	PrefixBlocksHit     uint64 `json:"prefix_blocks_hit,omitempty"`
 }
 
 // Worker is a data-plane node able to run inference.

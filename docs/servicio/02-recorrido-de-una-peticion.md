@@ -16,19 +16,21 @@ sequenceDiagram
 
     C->>API: POST /v1/chat/completions {stream:true}
     API->>API: decodificar JSON (máx. 4 MB) y validar
-    API->>API: renderPrompt + tokens.Estimate + ID
+    API->>API: renderPrompt + tokens.Estimate + prefix.Hashes + ID
     API->>P: Acquire(ctx, req)
     Note over P: si no cabe: espera en la cola del modelo<br/>hasta que el dispatcher le entregue un lease<br/>(o timeout → 503)
-    loop workers desde el desplazamiento round-robin
+    P->>P: PrefixAffinity: Tree.Match(PrefixHashes)<br/>y ordena los workers (afinidad, luego carga)
+    loop workers en ese orden
         P->>W: AcquireLease(ctx, req)
         W-->>P: Lease | ErrAtCapacity | ...
     end
+    P->>P: Tree.Insert(worker elegido, PrefixHashes)
     P-->>API: Lease (o error → 4xx/503, fin)
     Note over API: defer lease.Release()
     API->>C: 200 + cabeceras SSE
     API->>G: StartStream(ctx, lease, 16)
     G->>L: ExecuteStream(ctx, out)
-    L->>L: espera TTFT (prefill)
+    L->>L: espera TTFT (prefill de lo no cacheado)
     loop cada token
         L-->>G: TokenChunk (canal out)
         G-->>API: chunk
@@ -62,12 +64,15 @@ sequenceDiagram
 | `Prompt` | `renderPrompt`: cada mensaje como `role: content\n`. |
 | `PromptTokens` | `tokens.Estimate(Prompt)` (~4 caracteres/token, FI-3). |
 | `MaxNewTokens` | El `max_tokens` resuelto en el paso 1. |
+| `PrefixHashes` | `prefix.Hashes(model, Prompt)`: un hash encadenado por cada bloque completo de 64 caracteres (16 tokens estimados). `nil` si el prompt es más corto. Se calcula aquí, una vez, porque la colocación puede intentarse muchas veces mientras la petición espera en la cola ([09 · Decisión 2](09-fase-3-routing-por-prefijos.md#decisión-2-dónde-se-calculan-los-hashes)). |
 
 `renderPrompt` **no** es una *chat template* real: solo sirve para estimar el coste. Ver [06 · Relación con vLLM](06-relacion-con-vllm.md) para lo que implica.
 
 ### 3. Admisión: obtener un lease
 
-`s.sched.Acquire(r.Context(), req)` intenta un lease y, si no hay capacidad, espera en la cola del modelo hasta que el dispatcher se lo entregue o venza el timeout (ver [01 · Arquitectura](01-arquitectura.md#internalscheduler--admisión-y-colocación-fase-2)). Durante la espera el cliente no recibe ningún byte. Si falla, `writeAdmissionError` elige la respuesta:
+`s.sched.Acquire(r.Context(), req)` intenta un lease y, si no hay capacidad, espera en la cola del modelo hasta que el dispatcher se lo entregue o venza el timeout (ver [01 · Arquitectura](01-arquitectura.md#internalscheduler--admisión-y-colocación-fase-2)). Durante la espera el cliente no recibe ningún byte.
+
+Con la colocación por defecto del binario (`PrefixAffinity`, Fase 3), cada intento de colocación consulta el radix tree y prueba primero los workers que tienen el prefijo más largo de la petición y no están cargados, y después el resto del menos al más cargado. Al conceder el lease, el prefijo queda registrado para ese worker. Ver [09 · Cómo funciona](09-fase-3-routing-por-prefijos.md#cómo-funciona). Si falla, `writeAdmissionError` elige la respuesta:
 
 | Error | Respuesta |
 | :--- | :--- |

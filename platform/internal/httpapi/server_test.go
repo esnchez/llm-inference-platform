@@ -289,3 +289,33 @@ func TestModelsAndDebugEndpoints(t *testing.T) {
 		t.Fatalf("snapshots = %+v, err = %v", snaps, err)
 	}
 }
+
+func TestRequestsCarryPrefixHashes(t *testing.T) {
+	s := New(nil, DefaultConfig(), nil)
+	system := chatMessage{Role: "system", Content: strings.Repeat("Eres un asistente de soporte. ", 20)}
+	build := func(msgs ...chatMessage) inference.InferenceRequest {
+		t.Helper()
+		r, err := s.toInferenceRequest(chatRequest{Model: model, Messages: msgs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	a := build(system, chatMessage{Role: "user", Content: strings.Repeat("¿Cómo cambio mi contraseña? ", 5)})
+	b := build(system, chatMessage{Role: "user", Content: strings.Repeat("¿Dónde está mi factura? ", 5)})
+	// The system prompt fills 9 full blocks (608 characters incl. "system: ").
+	if len(a.PrefixHashes) < 10 || len(b.PrefixHashes) < 10 {
+		t.Fatalf("blocks: %d and %d", len(a.PrefixHashes), len(b.PrefixHashes))
+	}
+	for i := range 9 {
+		if a.PrefixHashes[i] != b.PrefixHashes[i] {
+			t.Fatalf("block %d of the shared system prompt hashes differently", i)
+		}
+	}
+	if a.PrefixHashes[len(a.PrefixHashes)-1] == b.PrefixHashes[len(b.PrefixHashes)-1] {
+		t.Fatal("different user messages must end in different blocks")
+	}
+	if short := build(chatMessage{Role: "user", Content: "hola"}); short.PrefixHashes != nil {
+		t.Fatalf("a prompt shorter than a block has hashes: %v", short.PrefixHashes)
+	}
+}

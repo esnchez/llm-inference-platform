@@ -3,8 +3,8 @@ package tokens
 
 import "unicode/utf8"
 
-// charsPerToken is the usual rule of thumb for BPE tokenizers on English text.
-const charsPerToken = 4
+// CharsPerToken is the usual rule of thumb for BPE tokenizers on English text.
+const CharsPerToken = 4
 
 // Estimate returns an approximate token count for text (about 4 characters
 // per token, at least 1 for non-empty text). It is only an admission-control
@@ -14,5 +14,5 @@ func Estimate(text string) int {
 	if n == 0 {
 		return 0
 	}
-	return (n + charsPerToken - 1) / charsPerToken
+	return (n + CharsPerToken - 1) / CharsPerToken
 }

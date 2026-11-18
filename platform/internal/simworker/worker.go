@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"llm-inference-platform/internal/inference"
+	"llm-inference-platform/internal/prefix"
 )
 
 // Config describes one simulated worker.
@@ -41,6 +42,12 @@ type Config struct {
 	// ITL = InterTokenLatency × (1 + ITLLoadFactor × (active leases − 1)).
 	// Zero keeps the ITL constant.
 	ITLLoadFactor float64
+	// PrefixCacheBlocks enables a simulated prefix cache of this many blocks
+	// (prefix.BlockTokens tokens each). A request whose first k PrefixHashes
+	// are cached skips their prefill: TTFT = BaseTTFT + PrefillPerToken ×
+	// uncached prompt tokens. Zero disables the cache (every prompt token is
+	// prefilled).
+	PrefixCacheBlocks int
 }
 
 // Worker is a simulated inference worker. It is safe for concurrent use.
@@ -48,6 +55,7 @@ type Worker struct {
 	cfg      Config
 	models   map[string]struct{}
 	capacity chan struct{} // buffer 1: CapacityChanged signal
+	cache    *prefixCache  // nil when PrefixCacheBlocks is 0
 
 	mu       sync.Mutex
 	reserved int
@@ -69,15 +77,19 @@ func New(cfg Config) (*Worker, error) {
 		return nil, fmt.Errorf("simworker: token budget must be positive, got %d", cfg.TokenBudget)
 	case cfg.BaseTTFT < 0 || cfg.PrefillPerToken < 0 || cfg.InterTokenLatency < 0 || cfg.LeaseTTL < 0:
 		return nil, errors.New("simworker: durations must not be negative")
-	case cfg.MeanOutputTokens < 0 || cfg.ITLLoadFactor < 0:
-		return nil, errors.New("simworker: output mean and ITL load factor must not be negative")
+	case cfg.MeanOutputTokens < 0 || cfg.ITLLoadFactor < 0 || cfg.PrefixCacheBlocks < 0:
+		return nil, errors.New("simworker: output mean, ITL load factor and prefix cache size must not be negative")
 	}
 	models := make(map[string]struct{}, len(cfg.Models))
 	for _, m := range cfg.Models {
 		models[m] = struct{}{}
 	}
 	cfg.Models = append([]string(nil), cfg.Models...)
-	return &Worker{cfg: cfg, models: models, capacity: make(chan struct{}, 1)}, nil
+	w := &Worker{cfg: cfg, models: models, capacity: make(chan struct{}, 1)}
+	if cfg.PrefixCacheBlocks > 0 {
+		w.cache = newPrefixCache(cfg.PrefixCacheBlocks)
+	}
+	return w, nil
 }
 
 func (w *Worker) ID() string { return w.cfg.ID }
@@ -122,16 +134,21 @@ func (w *Worker) AcquireLease(ctx context.Context, req inference.InferenceReques
 
 // Snapshot returns the current state of the worker.
 func (w *Worker) Snapshot() inference.WorkerSnapshot {
+	cacheCap, cacheUsed, queried, hit := w.cache.stats()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return inference.WorkerSnapshot{
-		WorkerID:       w.cfg.ID,
-		Models:         w.Models(),
-		TokenBudget:    w.cfg.TokenBudget,
-		TokensReserved: w.reserved,
-		ActiveLeases:   w.active,
-		LeasesGranted:  w.granted,
-		LeasesRejected: w.rejected,
+		WorkerID:            w.cfg.ID,
+		Models:              w.Models(),
+		TokenBudget:         w.cfg.TokenBudget,
+		TokensReserved:      w.reserved,
+		ActiveLeases:        w.active,
+		LeasesGranted:       w.granted,
+		LeasesRejected:      w.rejected,
+		PrefixCacheBlocks:   cacheCap,
+		PrefixCacheUsed:     cacheUsed,
+		PrefixBlocksQueried: queried,
+		PrefixBlocksHit:     hit,
 	}
 }
 
@@ -248,8 +265,9 @@ func (l *lease) expire() {
 	l.w.free(l.cost)
 }
 
-// ExecuteStream simulates prefill (TTFT) then decodes up to MaxNewTokens
-// tokens (fewer when MeanOutputTokens is set).
+// ExecuteStream simulates prefill (TTFT, without the cached prefix blocks)
+// then decodes up to MaxNewTokens tokens (fewer when MeanOutputTokens is
+// set).
 func (l *lease) ExecuteStream(ctx context.Context, out chan<- inference.TokenChunk) error {
 	if err := l.begin(); err != nil {
 		return err
@@ -258,7 +276,8 @@ func (l *lease) ExecuteStream(ctx context.Context, out chan<- inference.TokenChu
 	defer l.Release()
 
 	cfg := l.w.cfg
-	ttft := cfg.BaseTTFT + time.Duration(l.req.PromptTokens)*cfg.PrefillPerToken
+	cached := min(l.w.cache.use(l.req.PrefixHashes)*prefix.BlockTokens, l.req.PromptTokens)
+	ttft := cfg.BaseTTFT + time.Duration(l.req.PromptTokens-cached)*cfg.PrefillPerToken
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	defer timer.Stop()

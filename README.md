@@ -1,6 +1,6 @@
 # Distributed LLM Inference Platform
 
-> **Estado:** Fases 1 y 2 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*). Decisiones de la Fase 2: [`docs/servicio/08-fase-2-decisiones.md`](docs/servicio/08-fase-2-decisiones.md).  
+> **Estado:** Fases 1 a 3 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md).  
 > **Documentación de la implementación:** [`docs/servicio/`](docs/servicio/README.md) (componentes, recorrido de una petición, leases, relación con vLLM).  
 > **Objetivo:** Construir una plataforma de serving de LLM distribuida a nivel de producción, con routing consciente de KV-Cache (Prefix-aware), scheduling basado en capacidad de tokens (VRAM), control de concurrencia atómico mediante *leases*, y autoscaling predictivo para K8s/vLLM.
 
@@ -109,10 +109,12 @@ type Lease interface {
 ## 4. Scheduling y Routing Avanzado
 
 ### 4.1 Radix Tree para Prefix Caching
-El *Control Plane* mantiene en memoria un **Radix Tree** de los hashes de los *System Prompts* o prefijos largos activos en el clúster. 
-- Al llegar una petición, el Router busca la coincidencia de prefijo más larga.
-- Si el `Worker-B` tiene ese prefijo en su memoria caché local y dispone de capacidad (puede emitir un Lease), la petición se enruta allí.
-- **Resultado:** Reducción drástica del *Time To First Token (TTFT)*.
+El *Control Plane* mantiene en memoria un **Radix Tree** de los prefijos que tiene cada worker en su KV-Cache (implementado en la Fase 3, ver [`docs/servicio/09-fase-3-routing-por-prefijos.md`](docs/servicio/09-fase-3-routing-por-prefijos.md)).
+- Cada prompt se corta en bloques de 16 tokens y cada bloque recibe un hash **encadenado** (identifica todo el prefijo hasta él), igual que el *prefix caching* de vLLM. Así cuenta cualquier prefijo compartido: *system prompt*, historial de una conversación o documentos de RAG.
+- Al llegar una petición, el Router busca, por worker, la coincidencia de prefijo más larga. Prueba primero los workers con el prefijo más largo cuya carga esté por debajo de un umbral (0,8), y después el resto del menos al más cargado. Sigue siendo `AcquireLease` quien decide si cabe.
+- Si el worker afín está cargado, la petición **desborda** al menos cargado, que pasa a tener también el prefijo: los prefijos populares se replican solos en vez de saturar un worker ([FI-6](#fi-6-el-radix-tree-solo-aproxima-la-caché-real-y-concentra-prefijos-populares)).
+- El router no ve lo que expulsa cada GPU, así que el árbol se acota con una capacidad LRU por worker que imita su caché.
+- **Resultado (simulador):** con 24 *system prompts* de ~1.500 tokens y 3 workers, el TTFT p50 baja de 206 ms (round-robin) a 57 ms, y el acierto de caché sube del 40 % al 75 %.
 
 ### 4.2 Control de Admisión (Load Shedding & Backpressure)
 Hay dos preguntas distintas, resueltas por piezas distintas (implementado en la Fase 2):
@@ -130,6 +132,7 @@ El desarrollo comienza sin hardware físico. El **Simulated Worker** en Go falsi
 - **Streaming:** Emite tokens simulados a través de canales con pausas artificiales (*Inter-Token Latency*).
 - **Cancelación:** Reacciona a `ctx.Done()`, liberando instantáneamente los tokens de la VRAM simulada.
 - **Realismo (Fase 2):** longitud de salida aleatoria (exponencial con media configurable, acotada por `max_tokens`) e ITL que crece con el número de leases activos, para que las políticas de cola se puedan evaluar.
+- **Caché de prefijos (Fase 3):** una LRU de bloques por worker; el prefill solo cuesta los tokens no cacheados, para que el routing por prefijos se pueda medir.
 
 Esto valida el encolado, la concurrencia, los data races y la resiliencia del Control Plane con miles de peticiones locales antes de provisionar hardware real.
 
@@ -165,11 +168,12 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Tests de contrato y de estrés con invariantes (`go test -race`), métricas en `/debug/scheduler` y generador de carga `cmd/loadgen`.
 
 ### Fase 3 — Inteligencia de Enrutamiento (KV-Cache)
-> Revisar antes de empezar: [FI-6](#fi-6-el-radix-tree-solo-aproxima-la-caché-real-y-concentra-prefijos-populares).
+> Diseño, decisiones y mediciones: [`docs/servicio/09-fase-3-routing-por-prefijos.md`](docs/servicio/09-fase-3-routing-por-prefijos.md). Resuelve la parte de diseño de [FI-6](#fi-6-el-radix-tree-solo-aproxima-la-caché-real-y-concentra-prefijos-populares).
 
-- [ ] Implementación del Radix Tree en memoria.
-- [ ] Detección y hasheo de prefijos compartidos en las requests.
-- [ ] Algoritmo de afinidad: priorizar workers con prefijos cacheados si tienen capacidad libre.
+- [x] Implementación del Radix Tree en memoria (aristas comprimidas, capacidad LRU por worker).
+- [x] Detección y hasheo de prefijos compartidos en las requests (bloques de 16 tokens, hashes encadenados).
+- [x] Algoritmo de afinidad: priorizar workers con prefijos cacheados si tienen capacidad libre (umbral de carga y desbordamiento).
+- [x] Caché de prefijos en el worker simulado, métricas de acierto previsto/real y `loadgen -prefixes`.
 
 ### Fase 4 — Resiliencia y Ciclo de Vida
 - [ ] Heartbeats y healthchecks del worker hacia el registry.
@@ -209,8 +213,10 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 ```bash
 # Plano de control + 3 workers simulados en :8080
 task run -- -workers 3 -token-budget 16384 -itl 20ms   # equivale a: cd platform && go run ./cmd/platform ...
-task run -- -h                    # resto de opciones (ttft, itl-load-factor, mean-output-tokens, queue-timeout, ...)
+task run -- -h                    # resto de opciones (ttft, itl-load-factor, queue-timeout, placement, affinity-max-load, ...)
 task loadgen -- -rate 30 -duration 10s   # carga realista contra el servidor en marcha
+task loadgen -- -rate 4 -duration 60s -prefixes 24 -rag-fraction 0   # system prompts compartidos (routing por prefijos)
+task run -- -placement round-robin       # colocación de la Fase 2, para comparar
 ```
 
 **Suite de tests** (definida en `Taskfile.yml`; `task --list` muestra todas las tareas):
@@ -221,7 +227,7 @@ task loadgen -- -rate 30 -duration 10s   # carga realista contra el servidor en 
 | `task check:all` | `check` + `test:race`. Ejecutar antes de cerrar cada fase. |
 | `task fmt:check` | Falla si algún fichero no está formateado con `gofmt`. |
 | `task vet` | `go vet ./...` |
-| `task test` | Tests unitarios y HTTP (leases, scheduler y cola, API SSE), incluido el test de estrés con invariantes. |
+| `task test` | Tests unitarios y HTTP (leases, scheduler y cola, afinidad de prefijo y Radix Tree, API SSE), incluido el test de estrés con invariantes. |
 | `task test:race` | `go test -race -count=5` en un contenedor `golang:1.23` (Docker; no requiere gcc). |
 | `task test:race:local` | Igual, en el host (requiere cgo: gcc en Windows). |
 | `task test:cover` | Informe de cobertura por función. |
@@ -232,8 +238,8 @@ task loadgen -- -rate 30 -duration 10s   # carga realista contra el servidor en 
 | :--- | :--- |
 | `POST /v1/chat/completions` | `stream: true` → SSE (`data: {...}` + `data: [DONE]`); `stream_options.include_usage` soportado. `stream: false` → respuesta agregada. |
 | `GET /v1/models` | Modelos servidos por el pool. |
-| `GET /debug/workers` | `WorkerSnapshot` de cada worker (presupuesto, reservado, leases). |
-| `GET /debug/scheduler` | Estado de la cola: peticiones y tokens en cola por modelo, tiempo en cola p50/p99, rechazos por motivo. |
+| `GET /debug/workers` | `WorkerSnapshot` de cada worker (presupuesto, reservado, leases, acierto real de su caché de prefijos). |
+| `GET /debug/scheduler` | Estado de la cola: peticiones y tokens en cola por modelo, tiempo en cola p50/p99, rechazos por motivo; con afinidad, sus contadores y el tamaño del Radix Tree (`placement`). |
 | `GET /healthz` | Liveness. |
 
 Errores de admisión (antes de enviar cabeceras): `400` petición inválida o que no cabe en ningún worker (`context_length_exceeded`), `404` modelo desconocido, `503` + `Retry-After` cuando la cola del modelo está llena (`queue_full`) o la petición no obtuvo capacidad dentro del timeout de cola (`queue_timeout`). Mientras espera en la cola, el cliente no recibe ningún byte. Un fallo a mitad de stream se notifica en banda con un evento `data: {"error": ...}`.
@@ -252,11 +258,12 @@ docs/servicio/                  # documentación detallada de la implementación
 platform/                       # módulo Go llm-inference-platform
 ├── go.mod
 ├── cmd/platform/               # binario: flags, wiring, graceful shutdown
-├── cmd/loadgen/                # generador de carga (Poisson, chat + RAG, cancelaciones)
+├── cmd/loadgen/                # generador de carga (Poisson, chat + RAG, cancelaciones, system prompts compartidos)
 └── internal/
     ├── inference/              # contrato core: Worker, Lease, InferenceRequest, TokenChunk, errores
-    ├── simworker/              # SimulatedWorker: presupuesto de tokens, TTFT/ITL simulados, TTL de leases
-    ├── scheduler/              # admisión (colas por modelo, dispatcher) + colocación (Placement round-robin)
+    ├── simworker/              # SimulatedWorker: presupuesto de tokens, TTFT/ITL simulados, TTL de leases, caché de prefijos
+    ├── scheduler/              # admisión (colas por modelo, dispatcher) + colocación (afinidad de prefijo o round-robin)
+    ├── prefix/                 # hashes de prefijo por bloque y Radix Tree de prefijos por worker
     ├── httpapi/                # API OpenAI-compatible con SSE
     └── tokens/                 # estimación de tokens (~4 caracteres/token) sin tokenizer
 ```
@@ -269,7 +276,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 
 ### FI-1. Reserva pesimista de capacidad
 - **Decisión actual:** cada lease reserva `prompt_tokens + max_new_tokens` (peor caso) durante todo el stream (`InferenceRequest.TokenCost`).
-- **Problema:** vLLM no reserva el peor caso: asigna bloques de KV-Cache a medida que genera y, si se queda sin memoria, expulsa (*preemption*) peticiones. Los clientes suelen pedir `max_tokens` de 2–4K con salidas reales de unos cientos de tokens, así que rechazaremos peticiones (`503`) con la GPU lejos de estar llena. Además, con *prefix caching* los bloques de un prefijo compartido se cuentan una vez por petición, lo que choca con el routing por afinidad de la Fase 3.
+- **Problema:** vLLM no reserva el peor caso: asigna bloques de KV-Cache a medida que genera y, si se queda sin memoria, expulsa (*preemption*) peticiones. Los clientes suelen pedir `max_tokens` de 2–4K con salidas reales de unos cientos de tokens, así que rechazaremos peticiones (`503`) con la GPU lejos de estar llena. Además, con *prefix caching* los bloques de un prefijo compartido se cuentan una vez por petición, lo que choca con el routing por afinidad de la Fase 3: concentra en un worker peticiones que comparten prefijo, y su carga de ledger se sobrestima aún más (medido en la Fase 3; ver [`09`](docs/servicio/09-fase-3-routing-por-prefijos.md#interacción-con-fi-1-la-reserva-pesimista)).
 - **Opciones:**
   - Reservar `prompt + salida esperada` (p. ej. p90 histórico por modelo/cliente) y aceptar *overbooking*, usando la preemption del motor como red de seguridad.
   - Liberar progresivamente la parte no usada de la reserva y descontar los tokens de prefijo ya cacheados.
@@ -305,7 +312,9 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 ### FI-6. El Radix Tree solo aproxima la caché real y concentra prefijos populares
 - **Problema:** el router no ve las expulsiones (*evictions*) que hace vLLM en su caché, así que el árbol puede apuntar a prefijos que ya no están. Además, la afinidad pura envía todo el tráfico de un *system prompt* popular al mismo worker y lo satura.
 - **Opciones:** TTL/LRU en las entradas del árbol; una puntuación que combine afinidad de prefijo y carga (p. ej. seguir la afinidad solo si la carga está por debajo de un umbral, o *power of two choices* entre los workers con el prefijo); replicar prefijos calientes en varios workers; usar eventos de KV-Cache del motor si la versión de vLLM los publica.
-- **Revisar:** al diseñar la Fase 3.
+- **Decisión (2026-11-17, Fase 3):** LRU por worker con la capacidad estimada de su caché (expulsión por hojas), afinidad solo por debajo de una carga de 0,8 y desbordamiento al menos cargado, que replica los prefijos calientes sin configurarlos. En el simulador, el acierto previsto por el árbol quedó a menos de 1 punto del real, y un único *system prompt* para todo el tráfico se replicó en los 3 workers tras 2 desbordamientos. Ver [`09`](docs/servicio/09-fase-3-routing-por-prefijos.md).
+- **Sigue abierto:** el árbol imita la caché porque una sola réplica ve todo el tráfico (FI-2); no ve reinicios de workers (Fase 4) ni las diferencias de la *chat template* real; los eventos de KV-Cache de vLLM se valorarán en la Fase 6.
+- **Revisar:** en la Fase 6, con la caché real de vLLM.
 
 ### FI-7. El contrato solo transporta el prompt aplanado
 - **Decisión actual:** `httpapi.renderPrompt` convierte los `messages` en texto `role: content\n` y `InferenceRequest` solo lleva ese `Prompt`, que se usa únicamente para estimar el coste. Los parámetros de muestreo (`temperature`, `top_p`, `stop`, …) se aceptan pero se ignoran.
