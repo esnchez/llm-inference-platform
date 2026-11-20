@@ -50,7 +50,8 @@ platform/
     ├── prefix/            hashes de prefijo por bloque y radix tree de prefijos (Fase 3)
     ├── simworker/         implementación simulada de Worker/Lease, con fallos inyectables
     ├── scheduler/         admisión, colocación, registro de workers, salud, breaker y reintentos
-    └── httpapi/           API HTTP OpenAI-compatible, SSE
+    ├── httpapi/           API HTTP OpenAI-compatible, SSE
+    └── metrics/           métricas Prometheus: implementa los observadores y lee el estado (Fase 5)
 ```
 
 El resto del repositorio (README, `docs/`, `Taskfile.yml`) queda fuera del módulo. Así, los componentes futuros (Helm charts, Dockerfiles, el operador de Kubernetes) pueden tener su propia carpeta junto a `platform/`.
@@ -59,7 +60,8 @@ Grafo de dependencias (las flechas son *imports*). No hay ciclos y `inference` n
 
 ```mermaid
 flowchart LR
-    main[cmd/platform] --> httpapi & scheduler & simworker & inference & prefix
+    main[cmd/platform] --> httpapi & scheduler & simworker & inference & prefix & metrics
+    metrics --> httpapi & scheduler & inference
     loadgen[cmd/loadgen] -. HTTP .-> main
     httpapi --> inference & tokens & prefix
     scheduler --> inference & prefix
@@ -176,7 +178,18 @@ Traduce HTTP ⇄ contrato `inference`: valida el JSON, construye el `InferenceRe
 
 Además de las rutas de `httpapi`, `cmd/platform` sirve los endpoints de administración de los workers simulados (`admin.go`): `POST /debug/workers` (alta), `DELETE /debug/workers/{id}` (baja con drenaje), `POST /debug/workers/{id}/faults` (inyectar fallos) y `POST /debug/workers/{id}/restart`. Ver [05](05-api-http.md#administración-de-workers-simulados-fase-4).
 
-Logs: JSON estructurado (`log/slog`) a stdout.
+Logs: JSON estructurado (`log/slog`) a stdout. El scheduler escribe con `component=scheduler`.
+
+### `internal/metrics` — métricas Prometheus (Fase 5)
+
+Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_golang`, la primera dependencia externa del módulo ([11 · Decisión 1](11-fase-5-decisiones.md#decisión-1-librería-de-métricas)). Combina dos mecanismos:
+
+| Mecanismo | Para qué | Cómo |
+| :--- | :--- | :--- |
+| **Eventos** | Contadores e histogramas: cada petición, cada token, cada fallo, cada transición del breaker | `Metrics` implementa `httpapi.Observer` y `scheduler.Observer`, dos interfaces pequeñas definidas por quien las consume. Por defecto son vacías: el núcleo no sabe nada de Prometheus. |
+| **Estado** | Gauges de lo que hay ahora: cola, reservado, salud, árbol de prefijos | Un *collector* lee `Scheduler.Stats()` y `Snapshots()` en cada *scrape*: los mismos datos que `/debug`, así que no pueden contradecirse. |
+
+`cmd/platform` crea un `metrics.Metrics`, lo pasa como `Observer` a la API y al scheduler, llama a `Watch(sched)` y sirve `GET /metrics` en el mismo puerto (FI-10). El catálogo completo está en [12 · Observabilidad](12-observabilidad.md#catálogo-de-métricas).
 
 | Flag | Por defecto | Qué controla |
 | :--- | :--- | :--- |
@@ -214,6 +227,8 @@ Logs: JSON estructurado (`log/slog`) a stdout.
 | `simworker.Worker` en el mismo proceso | Pod de vLLM con GPU; `VLLMAdapter` en el control plane habla con él por HTTP (Fase 6). |
 | Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el *watch* de los Endpoints de Kubernetes (Fase 7). |
 | Healthchecks contra `simworker.Health` | `GET /health` de vLLM desde el `VLLMAdapter` (Fase 6). |
+| `/metrics` y `/debug` en el puerto de la API | Puerto de administración solo accesible dentro del clúster (FI-10, Fase 7). |
+| Stack local con `docker-compose` (`deploy/observability`) | Prometheus y Grafana del clúster; el dashboard JSON se reutiliza. |
 | `PrefixAffinity` aproxima las cachés con su propio árbol LRU (Fase 3) | Corregirlo con eventos de KV-Cache de vLLM, si la versión fijada los publica (Fase 6). |
 | Caché de prefijos simulada en `simworker` | *Automatic prefix caching* de vLLM; `PrefixHashes` deja de usarse en el worker. |
 | Una réplica | Varias réplicas: ver **FI-2**. |

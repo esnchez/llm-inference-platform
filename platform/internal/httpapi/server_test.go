@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -388,5 +390,126 @@ func TestNoHealthyWorkers(t *testing.T) {
 			t.Fatalf("never got no_healthy_workers; last: %d %s", resp.StatusCode, body)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// records is an Observer that keeps every finished request.
+type records struct {
+	mu      sync.Mutex
+	started int
+	recs    []RequestRecord
+}
+
+func (r *records) RequestStarted(string) { r.mu.Lock(); r.started++; r.mu.Unlock() }
+func (r *records) RequestFinished(rec RequestRecord) {
+	r.mu.Lock()
+	r.recs = append(r.recs, rec)
+	r.mu.Unlock()
+}
+
+func (r *records) wait(t *testing.T, n int) []RequestRecord {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		r.mu.Lock()
+		got := slices.Clone(r.recs)
+		r.mu.Unlock()
+		if len(got) >= n {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d records", len(got), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func observedServer(t *testing.T, obs Observer, workers ...*simworker.Worker) *httptest.Server {
+	t.Helper()
+	ws := make([]inference.Worker, len(workers))
+	for i, w := range workers {
+		ws[i] = w
+	}
+	sched := scheduler.New(scheduler.Config{HealthInterval: -1, BreakerFailures: 100, MaxRetries: -1, Placement: &scheduler.RoundRobin{}}, ws...)
+	t.Cleanup(sched.Close)
+	cfg := DefaultConfig()
+	cfg.Observer = obs
+	ts := httptest.NewServer(New(sched, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestRequestOutcomes(t *testing.T) {
+	cases := []struct {
+		name   string
+		fault  simworker.Faults
+		body   string
+		want   RequestRecord
+		tokens int
+	}{
+		{"completed", simworker.Faults{}, chatBody(3, true, ""),
+			RequestRecord{Model: model, Outcome: OutcomeCompleted, Admitted: true, FirstToken: true}, 3},
+		{"unknown model", simworker.Faults{}, `{"model":"nope","max_tokens":3,"messages":[{"role":"user","content":"hi"}]}`,
+			RequestRecord{Model: UnknownModel, Outcome: OutcomeRejectedInvalid}, 0},
+		{"bad json", simworker.Faults{}, `{`, RequestRecord{Model: UnknownModel, Outcome: OutcomeRejectedInvalid}, 0},
+		{"too large", simworker.Faults{}, chatBody(4000, true, ""), RequestRecord{Model: model, Outcome: OutcomeRejectedInvalid}, 0},
+		{"worker down", simworker.Faults{Down: true}, chatBody(3, true, ""),
+			RequestRecord{Model: model, Outcome: OutcomeWorkerUnavailable, Admitted: true}, 0},
+		{"cut mid-stream", simworker.Faults{FailAfterTokens: 2}, chatBody(5, true, ""),
+			RequestRecord{Model: model, Outcome: OutcomeFailedMidstream, Admitted: true, FirstToken: true}, 2},
+		{"cut, no streaming", simworker.Faults{FailAfterTokens: 2}, chatBody(5, false, ""),
+			RequestRecord{Model: model, Outcome: OutcomeWorkerUnavailable, Admitted: true, FirstToken: true}, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			obs := &records{}
+			w, err := simworker.New(simworker.Config{ID: "w1", Models: []string{model}, TokenBudget: 1000, Faults: c.fault})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts := observedServer(t, obs, w)
+			resp := post(t, context.Background(), ts.URL, c.body)
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			got := obs.wait(t, 1)[0]
+			if got.Model != c.want.Model || got.Outcome != c.want.Outcome || got.Admitted != c.want.Admitted ||
+				got.FirstToken != c.want.FirstToken || got.CompletionTokens != c.tokens {
+				t.Fatalf("record = %+v, want %+v with %d tokens", got, c.want, c.tokens)
+			}
+			if got.Admitted && (got.PromptTokens == 0 || got.ReservedTokens <= got.PromptTokens || obs.started != 1) {
+				t.Fatalf("admitted request without token accounting: %+v (started %d)", got, obs.started)
+			}
+		})
+	}
+}
+
+func TestClientRequestID(t *testing.T) {
+	ts := observedServer(t, &records{}, sim(t, "w1", simworker.Faults{}))
+	for _, c := range []struct{ sent, want string }{
+		{"client-abc_1.2", "client-abc_1.2"},
+		{"has space", ""},
+		{strings.Repeat("x", 65), ""},
+		{"", ""},
+	} {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(chatBody(2, true, "")))
+		if c.sent != "" {
+			req.Header.Set("X-Request-Id", c.sent)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := readEvents(t, resp.Body)
+		resp.Body.Close()
+		got := resp.Header.Get("X-Request-Id")
+		switch {
+		case c.want != "" && got != c.want:
+			t.Errorf("sent %q: X-Request-Id %q", c.sent, got)
+		case c.want == "" && !strings.HasPrefix(got, "chatcmpl-"):
+			t.Errorf("sent %q: want a generated ID, got %q", c.sent, got)
+		}
+		if c.want != "" && !strings.Contains(events[0], `"id":"`+c.want+`"`) {
+			t.Errorf("the chunks do not carry the request ID: %s", events[0])
+		}
 	}
 }

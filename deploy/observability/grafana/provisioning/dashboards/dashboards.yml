@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: llm-platform
+    folder: LLM Platform
+    type: file
+    # Dashboards as code: the JSON files in deploy/observability/grafana/dashboards.
+    # Changes made in the UI are lost on restart unless exported to that file.
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

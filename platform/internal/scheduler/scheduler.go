@@ -32,6 +32,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -109,6 +110,14 @@ type Config struct {
 	// token is retried on another worker; a negative value disables
 	// retries.
 	MaxRetries int
+
+	// ---- Phase 5: observability ----
+
+	// Observer receives events for metrics. Default: NopObserver.
+	Observer Observer
+	// Logger receives the worker lifecycle events (added, removed, health,
+	// breaker, restarts, hangs, retries). Default: discard.
+	Logger *slog.Logger
 }
 
 // DefaultConfig returns the defaults (Phase 2 admission, Phase 4
@@ -195,6 +204,12 @@ func (c Config) withDefaults() Config {
 	if c.MaxRetries == 0 {
 		c.MaxRetries = d.MaxRetries
 	}
+	if c.Observer == nil {
+		c.Observer = NopObserver{}
+	}
+	if c.Logger == nil {
+		c.Logger = discardLogger
+	}
 	return c
 }
 
@@ -244,9 +259,10 @@ type waiter struct {
 
 // grant is a lease from one worker, as handed out by placeLocked.
 type grant struct {
-	lease inference.Lease
-	m     *member
-	probe bool // the half-open breaker's probe request
+	lease     inference.Lease
+	m         *member
+	probe     bool          // the half-open breaker's probe request
+	queueWait time.Duration // time spent in the queue before this grant
 }
 
 type counters struct {
@@ -319,7 +335,7 @@ func (s *Scheduler) Acquire(ctx context.Context, req inference.InferenceRequest)
 	if err != nil {
 		return nil, err
 	}
-	return &managedLease{s: s, req: req, cur: g}, nil
+	return &managedLease{s: s, req: req, cur: g, queueWait: g.queueWait}, nil
 }
 
 // acquire is Acquire without the lease decorator; exclude lists workers a
@@ -361,6 +377,7 @@ func (s *Scheduler) acquire(ctx context.Context, req inference.InferenceRequest,
 		g, err := s.placeLocked(ctx, m.name, req, exclude, now)
 		if err == nil {
 			s.stats.admittedImmediately++
+			s.cfg.Observer.Admitted(m.name, "immediate")
 			s.mu.Unlock()
 			return g, nil
 		}
@@ -424,11 +441,14 @@ func (s *Scheduler) leave(m *modelQueue, w *waiter, cancelled bool) *grant {
 	if i := slices.Index(m.queue, w); i >= 0 {
 		s.removeLocked(m, i)
 	}
+	wait := s.now().Sub(w.enqueued)
 	if cancelled {
 		s.stats.cancelledInQueue++
+		s.cfg.Observer.QueueLeft(m.name, "cancelled", wait)
 	} else {
 		s.stats.rejectedQueueTimeout++
-		s.recordWaitLocked(s.now().Sub(w.enqueued))
+		s.recordWaitLocked(wait)
+		s.cfg.Observer.QueueLeft(m.name, "timeout", wait)
 	}
 	s.mu.Unlock()
 	return nil
@@ -511,10 +531,13 @@ func (s *Scheduler) dispatch() {
 func (s *Scheduler) grantLocked(m *modelQueue, i int, g *grant, now time.Time) {
 	w := m.queue[i]
 	s.removeLocked(m, i)
+	g.queueWait = now.Sub(w.enqueued)
 	w.granted = true
 	w.ready <- g // buffer 1, sent once: never blocks
 	s.stats.admittedFromQueue++
-	s.recordWaitLocked(now.Sub(w.enqueued))
+	s.recordWaitLocked(g.queueWait)
+	s.cfg.Observer.Admitted(m.name, "queued")
+	s.cfg.Observer.QueueLeft(m.name, "admitted", g.queueWait)
 }
 
 func (s *Scheduler) recordWaitLocked(d time.Duration) {

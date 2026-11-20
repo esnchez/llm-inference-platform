@@ -16,6 +16,7 @@ import (
 
 	"llm-inference-platform/internal/httpapi"
 	"llm-inference-platform/internal/inference"
+	"llm-inference-platform/internal/metrics"
 	"llm-inference-platform/internal/prefix"
 	"llm-inference-platform/internal/scheduler"
 	"llm-inference-platform/internal/simworker"
@@ -100,8 +101,11 @@ func run() error {
 		return fmt.Errorf("unknown -placement %q (want prefix or round-robin)", *placement)
 	}
 
+	// Phase 5: one Prometheus registry, fed by the API and the scheduler.
+	mtr := metrics.New()
 	cfg := httpapi.DefaultConfig()
 	cfg.MaxTokensLimit = *maxTokens
+	cfg.Observer = mtr
 	sched := scheduler.New(scheduler.Config{
 		QueueTimeout:      *queueTimeout,
 		HeadMaxAge:        *headMaxAge,
@@ -115,14 +119,19 @@ func run() error {
 		TTFTTimeout:     *ttftTimeout,
 		StallTimeout:    *stallTimeout,
 		MaxRetries:      *maxRetries,
+
+		Observer: mtr,
+		Logger:   log.With("component", "scheduler"),
 	}, workers...)
 	defer sched.Close()
+	mtr.Watch(sched)
 	pool.sched = sched
 	api := httpapi.New(sched, cfg, log)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", api.Handler())
-	pool.register(mux) // POST/DELETE /debug/workers...: add, drain, break, restart
+	mux.Handle("GET /metrics", mtr.Handler()) // same port as the API for now (README §9, FI-10)
+	pool.register(mux)                        // POST/DELETE /debug/workers...: add, drain, break, restart
 
 	srv := &http.Server{
 		Addr:              *addr,

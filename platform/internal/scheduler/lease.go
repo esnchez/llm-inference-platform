@@ -28,14 +28,36 @@ type managedLease struct {
 	s   *Scheduler
 	req inference.InferenceRequest
 
-	mu       sync.Mutex
-	cur      *grant
-	curDone  bool // cur's lease was released and reported
-	executed bool
-	released bool
+	mu         sync.Mutex
+	cur        *grant
+	curDone    bool // cur's lease was released and reported
+	executed   bool
+	released   bool
+	queueWait  time.Duration
+	retries    int
+	workerTTFT time.Duration // of the attempt that emitted the first token
 }
 
 var _ inference.Lease = (*managedLease)(nil)
+
+// QueueWait is how long the request waited in the queue before its first
+// lease (Phase 5: the per-request log).
+func (l *managedLease) QueueWait() time.Duration { return l.queueWait }
+
+// Retries is how many times the request moved to another worker.
+func (l *managedLease) Retries() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.retries
+}
+
+// WorkerTTFT is the time from the start of the stream on the worker that
+// served the request to its first token (0 if none came).
+func (l *managedLease) WorkerTTFT() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.workerTTFT
+}
 
 func (l *managedLease) WorkerID() string {
 	l.mu.Lock()
@@ -91,8 +113,21 @@ func (l *managedLease) ExecuteStream(ctx context.Context, out chan<- inference.T
 
 	s := l.s
 	var exclude map[string]bool
+	retried := func(r streamRun) {
+		result := "failed"
+		if r.outcome == outcomeSuccess {
+			result = "succeeded"
+			s.count(func(c *counters) { c.retrySuccesses++ })
+		}
+		s.cfg.Observer.Retried(l.req.Model, result)
+	}
 	for attempt := 0; ; attempt++ {
 		r := s.runStream(ctx, l.req, g.lease, out)
+		if r.sent > 0 {
+			l.mu.Lock()
+			l.workerTTFT = r.ttft
+			l.mu.Unlock()
+		}
 		l.end(g, r.outcome, r.itl)
 		retry := r.outcome == outcomeFailure && r.sent == 0 && attempt < s.cfg.MaxRetries && ctx.Err() == nil
 		if retry {
@@ -101,8 +136,8 @@ func (l *managedLease) ExecuteStream(ctx context.Context, out chan<- inference.T
 			l.mu.Unlock()
 		}
 		if !retry {
-			if attempt > 0 && r.outcome == outcomeSuccess {
-				s.count(func(c *counters) { c.retrySuccesses++ })
+			if attempt > 0 {
+				retried(r)
 			}
 			return r.err
 		}
@@ -110,10 +145,16 @@ func (l *managedLease) ExecuteStream(ctx context.Context, out chan<- inference.T
 		if exclude == nil {
 			exclude = map[string]bool{}
 		}
-		exclude[g.lease.WorkerID()] = true
+		failed := g.lease.WorkerID()
+		exclude[failed] = true
 		s.count(func(c *counters) { c.retries++ })
+		s.cfg.Logger.Warn("request retried", "request_id", l.req.ID, "failed_worker", failed, "error", r.err)
+		l.mu.Lock()
+		l.retries++
+		l.mu.Unlock()
 		ng, err := s.acquire(ctx, l.req, exclude)
 		if err != nil {
+			retried(streamRun{outcome: outcomeFailure})
 			return r.err // nowhere else to go: report the original failure
 		}
 		l.mu.Lock()
@@ -138,6 +179,7 @@ type streamRun struct {
 	sent    int
 	err     error
 	outcome outcome
+	ttft    time.Duration // from the start of the stream to its first token
 	itl     time.Duration // mean inter-token latency, successful streams with >= 2 tokens
 }
 
@@ -146,6 +188,9 @@ type streamRun struct {
 func (s *Scheduler) runStream(ctx context.Context, req inference.InferenceRequest, lease inference.Lease, out chan<- inference.TokenChunk) streamRun {
 	inner, cancel := context.WithCancel(ctx)
 	defer cancel()
+	worker := lease.WorkerID()
+	obs := s.cfg.Observer
+	start := time.Now()
 	chunks, wait := inference.StartStream(inner, lease, 1)
 
 	ttftTimeout := s.cfg.TTFTTimeout + time.Duration(req.PromptTokens)*s.cfg.TTFTTimeoutPerToken
@@ -167,6 +212,10 @@ loop:
 			now := time.Now()
 			if r.sent == 0 {
 				first = now
+				r.ttft = now.Sub(start)
+				obs.WorkerFirstToken(worker, r.ttft)
+			} else {
+				obs.WorkerTokenGap(worker, now.Sub(last))
 			}
 			last = now
 			select {
@@ -194,7 +243,11 @@ loop:
 	switch {
 	case hang != "":
 		r.outcome = outcomeFailure
-		r.err = fmt.Errorf("%s: %w: %s", lease.WorkerID(), inference.ErrWorkerFailure, hang)
+		r.err = fmt.Errorf("%s: %w: %s", worker, inference.ErrWorkerFailure, hang)
+		kind := "ttft_timeout"
+		if r.sent > 0 {
+			kind = "stall_timeout"
+		}
 		s.count(func(c *counters) {
 			if r.sent == 0 {
 				c.ttftTimeouts++
@@ -202,6 +255,8 @@ loop:
 				c.stallTimeouts++
 			}
 		})
+		obs.WorkerFailure(worker, kind)
+		s.cfg.Logger.Warn("worker hung", "worker_id", worker, "request_id", req.ID, "kind", kind, "tokens_sent", r.sent)
 	case r.err == nil:
 		r.outcome = outcomeSuccess
 		if r.sent >= 2 {
@@ -211,6 +266,7 @@ loop:
 		r.outcome = outcomeNeutral // the client went away
 	case errors.Is(r.err, inference.ErrWorkerFailure):
 		r.outcome = outcomeFailure
+		obs.WorkerFailure(worker, "error")
 	default:
 		r.outcome = outcomeNeutral // a problem with the request, not the worker
 	}

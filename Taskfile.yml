@@ -9,6 +9,8 @@ vars:
   # How many times the race tests repeat, to shake out flaky interleavings.
   RACE_COUNT: 5
   COVER_FILE: coverage.out
+  # Local observability stack (Phase 5).
+  STACK_FILE: deploy/observability/docker-compose.yml
 
 tasks:
   default:
@@ -36,6 +38,25 @@ tasks:
     cmds:
       - go build -o bin/platform{{exeExt}} ./cmd/platform
       - go build -o bin/loadgen{{exeExt}} ./cmd/loadgen
+
+  # ---- observability stack (Phase 5, docs/servicio/12-observabilidad.md) ----
+
+  stack:up:
+    desc: "Start platform + Prometheus + Grafana in Docker (http://localhost:3000, :9090, :8080)"
+    cmds:
+      - docker compose -f {{.STACK_FILE}} up -d --build
+      - cmd: 'echo "Grafana: http://localhost:3000  Prometheus: http://localhost:9090  API: http://localhost:8080"'
+        silent: true
+
+  stack:down:
+    desc: Stop and remove the observability stack (its data is not kept)
+    cmds:
+      - docker compose -f {{.STACK_FILE}} down
+
+  stack:logs:
+    desc: Follow the platform's JSON logs in the stack
+    cmds:
+      - docker compose -f {{.STACK_FILE}} logs -f platform
 
   # ---- testing suite ----
 

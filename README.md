@@ -1,6 +1,6 @@
 # Distributed LLM Inference Platform
 
-> **Estado:** Fases 1 a 4 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md).  
+> **Estado:** Fases 1 a 4 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md), [Fase 5](docs/servicio/11-fase-5-decisiones.md). **Observabilidad:** [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md).  
 > **Documentación de la implementación:** [`docs/servicio/`](docs/servicio/README.md) (componentes, recorrido de una petición, leases, relación con vLLM).  
 > **Objetivo:** Construir una plataforma de serving de LLM distribuida a nivel de producción, con routing consciente de KV-Cache (Prefix-aware), scheduling basado en capacidad de tokens (VRAM), control de concurrencia atómico mediante *leases*, y autoscaling predictivo para K8s/vLLM.
 
@@ -186,16 +186,17 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Desconexiones de clientes propagadas al worker (hecho en la Fase 1, ver [FI-5](#fi-5-solapamiento-del-roadmap)).
 
 ### Fase 5 — Observabilidad
+> Decisiones e implementación: [`docs/servicio/11-fase-5-decisiones.md`](docs/servicio/11-fase-5-decisiones.md). Catálogo de métricas, dashboard, ejemplo de lectura y guía de diagnóstico: [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md).
 > Adelantado en la Fase 2: profundidad de cola, tiempo en cola p50/p99 y rechazos por motivo en `GET /debug/scheduler` (JSON, sin Prometheus).
 
-- [ ] Instrumentación de logs estructurados (slog).
-- [ ] Exposición de métricas Prometheus: TTFT simulado, inter-token latency simulado, ratio de saturación, tasa de rechazo.
-- [ ] Grafana Dashboard local (docker-compose).
+- [x] Instrumentación de logs estructurados (slog): eventos de ciclo de vida del scheduler, log por petición con `outcome`, `X-Request-Id`.
+- [x] Exposición de métricas Prometheus: TTFT (del cliente y del worker), inter-token latency, ratio de saturación, tasa de rechazo y ~40 más (`GET /metrics`).
+- [x] Grafana Dashboard local (docker-compose): `task stack:up`, dashboard como código, alertas de ejemplo.
 
 ### Fase 6 — Adaptador vLLM y GPUs Físicas
 > Revisar antes de empezar: [FI-1](#fi-1-reserva-pesimista-de-capacidad), [FI-3](#fi-3-estimación-de-tokens-sin-tokenizer), [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm), [FI-7](#fi-7-el-contrato-solo-transporta-el-prompt-aplanado), [FI-8](#fi-8-un-tokenchunk-no-siempre-es-un-token), [FI-9](#fi-9-las-cabeceras-200-se-envían-antes-de-que-el-worker-responda).
 
-- [ ] Empaquetado en Docker de los componentes de Go.
+- [ ] Empaquetado en Docker de los componentes de Go. *(Adelantado en la Fase 5: `platform/Dockerfile` del control plane con workers simulados.)*
 - [ ] Implementar `VLLMAdapter` que traduce el contrato `Lease` a llamadas reales de la API de vLLM.
 - [ ] Provisionar clúster efímero de GPUs (AWS/RunPod) con modelos ligeros (Llama-3-8B).
 - [ ] Benchmarking (llmperf) comparando el Router Inteligente vs Balanceo clásico.
@@ -223,6 +224,10 @@ task loadgen -- -rate 30 -duration 10s   # carga realista contra el servidor en 
 task loadgen -- -rate 4 -duration 60s -prefixes 24 -rag-fraction 0   # system prompts compartidos (routing por prefijos)
 task run -- -placement round-robin       # colocación de la Fase 2, para comparar
 task loadgen -- -rate 4 -duration 45s -chaos down   # tumba sim-worker-1 a mitad de la prueba (o hang, errors, stall, slow, restart)
+
+# Observabilidad (necesita Docker): plataforma + Prometheus (:9090) + Grafana (:3000) con el dashboard
+task stack:up
+task stack:down
 ```
 
 **Suite de tests** (definida en `Taskfile.yml`; `task --list` muestra todas las tareas):
@@ -247,6 +252,7 @@ task loadgen -- -rate 4 -duration 45s -chaos down   # tumba sim-worker-1 a mitad
 | `GET /debug/workers` | `WorkerSnapshot` de cada worker (presupuesto, reservado, leases, acierto real de su caché de prefijos). |
 | `GET /debug/scheduler` | Estado de la cola: peticiones y tokens en cola por modelo, tiempo en cola p50/p99, rechazos por motivo; con afinidad, sus contadores y el tamaño del Radix Tree (`placement`). |
 | `GET /healthz` | Liveness. |
+| `GET /metrics` | Métricas Prometheus (Fase 5); catálogo en [`12-observabilidad.md`](docs/servicio/12-observabilidad.md). |
 | `POST /debug/workers`, `DELETE /debug/workers/{id}` | Alta de un worker simulado y baja con drenaje (Fase 4). |
 | `POST /debug/workers/{id}/faults`, `.../restart` | Inyectar fallos (`{"down": true}`, `{"hang": true}`, `{"error_rate": 0.3}`, …; `{}` los quita) o simular un reinicio. |
 
@@ -263,6 +269,7 @@ curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 ```text
 README.md, Taskfile.yml
 docs/servicio/                  # documentación detallada de la implementación
+deploy/observability/           # docker-compose con Prometheus y Grafana, alertas y dashboard (Fase 5)
 platform/                       # módulo Go llm-inference-platform
 ├── go.mod
 ├── cmd/platform/               # binario: flags, wiring, graceful shutdown, /debug de administración de workers
@@ -273,6 +280,7 @@ platform/                       # módulo Go llm-inference-platform
     ├── scheduler/              # admisión (colas por modelo, dispatcher), colocación (afinidad o round-robin), registro, salud, breaker, reintentos
     ├── prefix/                 # hashes de prefijo por bloque y Radix Tree de prefijos por worker
     ├── httpapi/                # API OpenAI-compatible con SSE
+    ├── metrics/                # métricas Prometheus (Fase 5)
     └── tokens/                 # estimación de tokens (~4 caracteres/token) sin tokenizer
 ```
 
@@ -341,3 +349,9 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Problema:** vLLM puede rechazar la petición al empezar (p. ej. `prompt + max_tokens` mayor que `--max-model-len` según su tokenizer real, que puede no coincidir con nuestra estimación, FI-3). Ese rechazo llegaría como error *en banda* dentro de un stream `200`, en lugar de un `400` que los clientes y los benchmarks clasifican correctamente.
 - **Opciones:** retrasar la escritura de cabeceras hasta el primer chunk o hasta la primera respuesta de vLLM (el cliente no recibe cabeceras hasta que el worker responde, y el handler se complica); validar la longitud con el tokenizer real antes de admitir (ligado a FI-3).
 - **Resuelto (2026-11-18, Fase 4):** las cabeceras se envían con el primer chunk. Un fallo antes del primer token se reintenta en otro worker y, si no se puede, llega al cliente con su código (`503 worker_unavailable`, o `400` si el motor rechaza la petición). Queda para la Fase 6 que el `VLLMAdapter` traduzca el `400` de vLLM a `ErrRequestTooLarge` y no a `ErrWorkerFailure`. Ver [`10`](docs/servicio/10-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9).
+
+### FI-10. `/metrics`, `/debug` y la administración comparten puerto con la API pública
+- **Decisión actual:** `cmd/platform` sirve en el mismo puerto la API, `GET /metrics` (Fase 5), `/debug/scheduler`, `/debug/workers` y los endpoints que dan de alta, de baja, rompen y reinician workers simulados (Fase 4).
+- **Problema:** cualquiera que llegue a la API puede leer las métricas y el estado interno, y alterar el pool. Aceptable en local; inaceptable expuesto.
+- **Opciones:** un segundo *listener* (`-admin-addr`) solo accesible dentro del clúster para `/metrics` y `/debug/*`; o autenticación en esas rutas. Con vLLM, los endpoints que rompen workers simulados desaparecen.
+- **Revisar:** antes de desplegar (Fase 7).

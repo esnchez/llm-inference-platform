@@ -49,6 +49,8 @@ type Config struct {
 	StreamBuffer int
 	// MaxBodyBytes caps the request body size.
 	MaxBodyBytes int64
+	// Observer receives one record per request (Phase 5). Default: none.
+	Observer Observer
 }
 
 // DefaultConfig returns sensible defaults.
@@ -74,6 +76,9 @@ type Server struct {
 func New(sched Scheduler, cfg Config, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.Observer == nil {
+		cfg.Observer = nopObserver{}
 	}
 	return &Server{sched: sched, cfg: cfg, log: log, now: time.Now}
 }
@@ -180,21 +185,33 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleChatCompletions(rw http.ResponseWriter, r *http.Request) {
 	start := s.now()
+	w := &statusWriter{ResponseWriter: rw}
+	requestID := clientRequestID(r.Header.Get("X-Request-Id"))
+	if requestID == "" {
+		requestID = newRequestID()
+	}
+	w.Header().Set("X-Request-Id", requestID)
+	rec := RequestRecord{Model: UnknownModel}
+	log := s.log.With("request_id", requestID)
+
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 	var body chatRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "", "invalid JSON body: "+err.Error())
+		s.finish(log, w, start, rec, OutcomeRejectedInvalid, nil, streamResult{err: err})
 		return
 	}
+	rec.Model = s.modelLabel(body.Model)
 	req, err := s.toInferenceRequest(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "", err.Error())
+		s.finish(log, w, start, rec, OutcomeRejectedInvalid, nil, streamResult{err: err})
 		return
 	}
-	log := s.log.With("request_id", req.ID, "model", req.Model,
-		"prompt_tokens", req.PromptTokens, "max_new_tokens", req.MaxNewTokens, "stream", body.Stream)
+	req.ID = requestID
+	log = log.With("prompt_tokens", req.PromptTokens, "max_new_tokens", req.MaxNewTokens, "stream", body.Stream)
 
 	// Admission (including any wait in the scheduler's queue) happens before
 	// any byte of the response is written, so that a rejection can still use
@@ -202,10 +219,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.sched.Acquire(r.Context(), req)
 	if err != nil {
 		s.writeAdmissionError(w, r.Context(), err)
-		log.Info("request rejected", "error", err)
+		s.finish(log, w, start, rec, failureOutcome(r.Context(), err), nil, streamResult{err: err})
 		return
 	}
 	defer lease.Release()
+	rec.Admitted = true
+	rec.PromptTokens, rec.ReservedTokens = req.PromptTokens, req.TokenCost()
+	s.cfg.Observer.RequestStarted(rec.Model)
 
 	// ctx is cancelled when the client disconnects or when we fail to write
 	// to it; the worker sees it and frees its capacity.
@@ -219,19 +239,73 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		res = s.collect(ctx, w, req, lease)
 	}
 
-	// After the stream: a retry may have moved the request to another worker.
-	attrs := []any{"worker_id", lease.WorkerID(), "completion_tokens", res.completionTokens, "duration_ms", s.now().Sub(start).Milliseconds()}
-	if !res.firstToken.IsZero() {
-		attrs = append(attrs, "ttft_ms", res.firstToken.Sub(start).Milliseconds())
-	}
+	outcome := OutcomeCompleted
 	switch {
 	case res.err == nil:
-		log.Info("request completed", attrs...)
-	case errors.Is(res.err, context.Canceled):
-		log.Info("request cancelled by client", attrs...)
+	case errors.Is(res.err, context.Canceled) || ctx.Err() != nil:
+		outcome = OutcomeCancelled
+	case body.Stream && res.completionTokens > 0:
+		outcome = OutcomeFailedMidstream // the 200 was sent: reported in-band
 	default:
-		log.Error("request failed", append(attrs, "error", res.err)...)
+		outcome = failureOutcome(ctx, res.err)
 	}
+	s.finish(log, w, start, rec, outcome, lease, res)
+}
+
+// finish logs the request and reports it to the observer: one log line and
+// one record per request, whatever happened.
+func (s *Server) finish(log *slog.Logger, w *statusWriter, start time.Time, rec RequestRecord,
+	outcome string, lease inference.Lease, res streamResult) {
+	rec.Outcome = outcome
+	rec.Duration = s.now().Sub(start)
+	rec.CompletionTokens = res.completionTokens
+	if !res.firstToken.IsZero() {
+		rec.FirstToken = true
+		rec.TTFT = res.firstToken.Sub(start)
+	}
+	s.cfg.Observer.RequestFinished(rec)
+
+	attrs := []any{"model", rec.Model, "outcome", outcome, "http_status", w.status,
+		"completion_tokens", res.completionTokens, "duration_ms", rec.Duration.Milliseconds()}
+	if rec.FirstToken {
+		attrs = append(attrs, "ttft_ms", rec.TTFT.Milliseconds())
+	}
+	if lease != nil {
+		// After the stream: a retry may have moved the request to another
+		// worker.
+		attrs = append(attrs, "worker_id", lease.WorkerID())
+		if d, ok := lease.(leaseDetails); ok {
+			attrs = append(attrs, "queue_wait_ms", d.QueueWait().Milliseconds(), "retries", d.Retries())
+			if rec.FirstToken {
+				attrs = append(attrs, "worker_ttft_ms", d.WorkerTTFT().Milliseconds())
+			}
+		}
+	}
+	if res.err != nil && outcome != OutcomeCancelled {
+		attrs = append(attrs, "error", res.err.Error())
+	}
+	switch outcome {
+	case OutcomeCompleted:
+		log.Info("request completed", attrs...)
+	case OutcomeCancelled:
+		log.Info("request cancelled by client", attrs...)
+	case OutcomeRejectedInvalid:
+		log.Info("request rejected", attrs...)
+	case OutcomeQueueFull, OutcomeQueueTimeout:
+		log.Warn("request shed", attrs...)
+	default:
+		log.Error("request failed", attrs...)
+	}
+}
+
+// modelLabel returns model if a worker serves it, else UnknownModel.
+func (s *Server) modelLabel(model string) string {
+	for _, m := range s.sched.Models() {
+		if m == model {
+			return model
+		}
+	}
+	return UnknownModel
 }
 
 type streamResult struct {

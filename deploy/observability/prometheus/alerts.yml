@@ -1,0 +1,47 @@
+# Example alerts (docs/servicio/12-observabilidad.md, "SLI, SLO y alertas").
+# Evaluated by Prometheus and visible at /alerts; no Alertmanager, so nobody
+# is notified. Thresholds are a starting point, to calibrate with vLLM.
+groups:
+  - name: llmplatform
+    rules:
+      - alert: ServerErrorsHigh
+        expr: |
+          (sum(rate(llmplatform_requests_total{outcome=~"rejected_no_healthy_workers|worker_unavailable|failed_midstream|error"}[5m])) or vector(0))
+            / sum(rate(llmplatform_requests_total{outcome!~"rejected_invalid|cancelled"}[5m])) > 0.005
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 0.5% of valid requests fail on the server side (availability SLO)."
+
+      - alert: NoHealthyWorkers
+        expr: sum by (model) (rate(llmplatform_requests_total{outcome="rejected_no_healthy_workers"}[1m])) > 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "Model {{ $labels.model }} has no healthy worker: requests are rejected."
+
+      - alert: WorkerBreakerOpen
+        expr: llmplatform_worker_breaker_state{state="open"} == 1
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Worker {{ $labels.worker }} has been isolated by its circuit breaker for 10 minutes."
+
+      - alert: SustainedLoadShedding
+        expr: |
+          (sum(rate(llmplatform_requests_total{outcome=~"rejected_queue_.*"}[10m])) or vector(0))
+            / sum(rate(llmplatform_requests_total{outcome!~"rejected_invalid|cancelled"}[10m])) > 0.01
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "More than 1% of valid requests are shed by the queue: capacity is short."
+
+      - alert: PrefixTreeOutOfSync
+        expr: |
+          (rate(llmplatform_prefix_blocks_predicted_hit_total[15m]) / rate(llmplatform_prefix_blocks_queried_total[15m]))
+          - (sum(rate(llmplatform_worker_prefix_cache_hit_blocks_total[15m])) / sum(rate(llmplatform_worker_prefix_cache_queried_blocks_total[15m])))
+          > 0.15
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "The router predicts 15+ points more prefix-cache hits than the workers get (FI-6)."

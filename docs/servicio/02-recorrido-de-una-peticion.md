@@ -139,18 +139,23 @@ Si `ctx` sigue vivo, se termina con `data: [DONE]`, la señal estándar de fin d
 
 La capacidad se libera **cuando `ExecuteStream` retorna** (lo hace el propio lease con un `defer` interno), no al salir del handler. El `defer lease.Release()` del handler no hace nada en el camino feliz (`Release` es idempotente); existe para los caminos en los que `ExecuteStream` nunca llega a ejecutarse (por ejemplo, un *panic* entre la admisión y el stream).
 
-### 8. Log
+### 8. Log y métricas
 
-Un único log por petición, con `request_id`, `model`, `worker_id`, `prompt_tokens`, `max_new_tokens`, `stream`, `completion_tokens`, `duration_ms` y `ttft_ms`:
+Al terminar, la petición deja **un log y un registro de métricas**, sea cual sea el resultado (Fase 5, ver [12 · Observabilidad](12-observabilidad.md)). Ambos llevan el mismo `outcome`: cada petición acaba en exactamente uno (`completed`, `cancelled`, `rejected_invalid`, `rejected_queue_full`, `rejected_queue_timeout`, `rejected_no_healthy_workers`, `worker_unavailable`, `failed_midstream` o `error`).
 
-| Mensaje | Cuándo |
-| :--- | :--- |
-| `request rejected` | Falló la admisión (incluye `error`). |
+Campos del log: `request_id`, `model`, `outcome`, `http_status`, `prompt_tokens`, `max_new_tokens`, `stream`, `completion_tokens`, `duration_ms`, `ttft_ms` y, si hubo lease, `worker_id`, `queue_wait_ms`, `retries` y `worker_ttft_ms`.
 
-El `worker_id` del log es el del worker que terminó sirviendo la petición: si hubo un reintento, el segundo.
-| `request completed` | Stream completo. |
-| `request cancelled by client` | El cliente se desconectó. |
-| `request failed` | Error del worker (nivel `ERROR`). |
+| Mensaje | Nivel | Cuándo |
+| :--- | :--- | :--- |
+| `request completed` | `INFO` | Stream completo. |
+| `request cancelled by client` | `INFO` | El cliente se desconectó. |
+| `request rejected` | `INFO` | `400`/`404`: petición inválida, demasiado grande o modelo desconocido. |
+| `request shed` | `WARN` | `503` por cola llena o timeout de cola. |
+| `request failed` | `ERROR` | Fallo del servidor: `no_healthy_workers`, `worker_unavailable`, error a mitad de stream, `500`. |
+
+- `request_id` es el `X-Request-Id` del cliente si lo envió y es válido (1–64 caracteres `[A-Za-z0-9._-]`); si no, uno generado. Se devuelve en la cabecera `X-Request-Id` de **todas** las respuestas, también las de error, y es el `id` de los chunks.
+- `worker_id` es el del worker que terminó sirviendo la petición: si hubo un reintento, el segundo.
+- `ttft_ms − worker_ttft_ms` ≈ `queue_wait_ms` + el tiempo perdido en el intento fallido: la descomposición del TTFT de esa petición.
 
 ## Fase B' — Sin streaming (`stream: false`)
 

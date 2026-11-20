@@ -1,0 +1,47 @@
+# Local observability stack (Phase 5): the platform, Prometheus and Grafana.
+# Start it with `task stack:up`; docs/servicio/12-observabilidad.md explains
+# the metrics and how to read the dashboard.
+name: llm-platform
+
+services:
+  platform:
+    build: ../../platform
+    image: llm-platform:dev
+    # -prefill-per-token 100us (~10k tokens/s of prefill, closer to a real 8B
+    # model than the 20us default) makes prefix-cache hits visible in TTFT,
+    # as in the Phase 3 measurements.
+    command: ["-addr", ":8080", "-prefill-per-token", "100us"]
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - platform
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      # Local only: anonymous read-only access; admin/admin to edit.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/llm-platform-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

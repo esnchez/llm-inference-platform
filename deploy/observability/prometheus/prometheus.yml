@@ -1,0 +1,18 @@
+# Prometheus for the local stack (Phase 5).
+global:
+  # Short interval: local tests last minutes, not days.
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  # The example alerts of docs/servicio/12-observabilidad.md. There is no
+  # Alertmanager: they are evaluated and shown at http://localhost:9090/alerts
+  # but notify nobody.
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: platform
+    static_configs:
+      - targets: ["platform:8080"]
+  # Variant: to scrape a binary started on the host with `task run`, stop the
+  # platform container and use host.docker.internal:8080 as the target.

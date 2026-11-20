@@ -107,6 +107,7 @@ func (s *Scheduler) AddWorker(w inference.Worker) error {
 		go s.healthLoop(mem)
 	}
 	s.mu.Unlock()
+	s.cfg.Logger.Info("worker added", "worker_id", mem.id, "models", mem.models, "token_budget", mem.budget)
 	s.wake()
 	return nil
 }
@@ -127,6 +128,7 @@ func (s *Scheduler) RemoveWorker(id string) error {
 	mem.draining = true
 	close(mem.stop)
 	s.recomputeLocked()
+	s.cfg.Logger.Info("worker draining", "worker_id", id, "in_flight", mem.inFlight)
 	if mem.inFlight == 0 {
 		s.finalizeLocked(mem)
 	}
@@ -140,6 +142,7 @@ func (s *Scheduler) finalizeLocked(mem *member) {
 	}
 	s.version++
 	s.forgetLocked(mem.id)
+	s.cfg.Logger.Info("worker removed", "worker_id", mem.id)
 	s.wake()
 }
 
@@ -188,6 +191,7 @@ func (s *Scheduler) healthLoop(mem *member) {
 		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.HealthTimeout)
 		st, err := mem.w.Health(ctx) // never under s.mu: it may be a network call
 		cancel()
+		s.cfg.Observer.HealthCheck(mem.id, err == nil)
 		s.mu.Lock()
 		s.recordHealthLocked(mem, st, err)
 		s.mu.Unlock()
@@ -202,7 +206,8 @@ func (s *Scheduler) recordHealthLocked(mem *member, st inference.HealthStatus, e
 		mem.healthFail++
 		if mem.healthy && mem.healthFail >= s.cfg.HealthFailThreshold {
 			mem.healthy = false
-			s.openLocked(mem, s.now())
+			s.cfg.Logger.Warn("worker unhealthy", "worker_id", mem.id, "consecutive_failures", mem.healthFail, "error", err)
+			s.openLocked(mem, s.now(), "unhealthy")
 		}
 		return
 	}
@@ -212,20 +217,24 @@ func (s *Scheduler) recordHealthLocked(mem *member, st inference.HealthStatus, e
 		if mem.instanceID != "" && st.InstanceID != mem.instanceID {
 			// Restarted: its prefix cache is empty (conflict C2).
 			s.stats.restartsDetected++
+			s.cfg.Observer.RestartDetected(mem.id)
+			s.cfg.Logger.Warn("worker restart detected", "worker_id", mem.id, "old_instance", mem.instanceID, "new_instance", st.InstanceID)
 			s.forgetLocked(mem.id)
 		}
 		mem.instanceID = st.InstanceID
 	}
 	if !mem.healthy && mem.healthOK >= s.cfg.HealthOKThreshold {
 		mem.healthy = true
+		s.cfg.Logger.Info("worker healthy", "worker_id", mem.id)
 		s.wake()
 	}
 }
 
 // ---- circuit breaker ----
 
-// openLocked opens mem's breaker, with an exponential cooldown.
-func (s *Scheduler) openLocked(mem *member, now time.Time) {
+// openLocked opens mem's breaker, with an exponential cooldown. reason is
+// "failures", "unhealthy" or "probe_failed" (for the log).
+func (s *Scheduler) openLocked(mem *member, now time.Time, reason string) {
 	if mem.breaker == breakerOpen {
 		return
 	}
@@ -239,6 +248,8 @@ func (s *Scheduler) openLocked(mem *member, now time.Time) {
 	mem.reopens++
 	mem.breakerOpens++
 	s.stats.breakerOpens++
+	s.cfg.Observer.BreakerTransition(mem.id, "open")
+	s.cfg.Logger.Warn("breaker opened", "worker_id", mem.id, "reason", reason, "cooldown", cooldown.String())
 }
 
 // usableLocked says whether placement may use mem now. An open breaker
@@ -253,6 +264,8 @@ func (s *Scheduler) usableLocked(mem *member, now time.Time) bool {
 			return false
 		}
 		mem.breaker = breakerHalfOpen
+		s.cfg.Observer.BreakerTransition(mem.id, "half_open")
+		s.cfg.Logger.Info("breaker half-open", "worker_id", mem.id)
 		fallthrough
 	case breakerHalfOpen:
 		return !mem.probing
@@ -370,6 +383,8 @@ func (s *Scheduler) finish(g *grant, o outcome, itl time.Duration) {
 		if g.probe && mem.breaker == breakerHalfOpen && mem.healthy {
 			mem.breaker = breakerClosed
 			mem.reopens = 0
+			s.cfg.Observer.BreakerTransition(mem.id, "closed")
+			s.cfg.Logger.Info("breaker closed", "worker_id", mem.id)
 			s.wake()
 		}
 	case outcomeFailure:
@@ -378,9 +393,9 @@ func (s *Scheduler) finish(g *grant, o outcome, itl time.Duration) {
 		s.stats.workerFailures++
 		switch {
 		case g.probe && mem.breaker == breakerHalfOpen:
-			s.openLocked(mem, s.now())
+			s.openLocked(mem, s.now(), "probe_failed")
 		case mem.breaker == breakerClosed && mem.consecFail >= s.cfg.BreakerFailures:
-			s.openLocked(mem, s.now())
+			s.openLocked(mem, s.now(), "failures")
 		}
 	}
 	if g.probe && o == outcomeNeutral {

@@ -58,7 +58,7 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | :--- | :--- |
 | `task check` | En cada cambio: `gofmt` + `go vet` + tests. |
 | `task check:all` | Antes de cerrar una fase: `check` + tests con `-race` en Docker. |
-| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %). |
+| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %; al cerrar la Fase 5: `metrics` 97 %, `scheduler` 94 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 92 %). |
 | `task loadgen` | Generador de carga contra un servidor en marcha (no es un test: sirve para comparar configuraciones). |
 
 ### `internal/simworker` — contrato del lease
@@ -143,6 +143,14 @@ Los tests usan un sondeo de seguridad de 1 hora, así que demuestran que es la s
 | `TestRemoveWorkerDrains` | Un worker en baja no recibe peticiones nuevas, su stream en curso termina, luego desaparece (también del árbol); sin workers, `404`. |
 | `TestDegradedWorkerOnlyUsedWhenOthersAreFull` | Un worker 10× más lento queda degradado y solo se usa cuando el otro está lleno. |
 
+`observe_test.go` (Fase 5), con un observador que registra cada evento y un `slog` que escribe en un buffer:
+
+| Test | Qué garantiza |
+| :--- | :--- |
+| `TestObserverAdmissionAndQueueEvents` | Admisión inmediata y desde la cola; salida de la cola como admitida y como cancelada. |
+| `TestObserverStreamFailureRetryAndBreaker` | Un cuelgue da `failure ttft_timeout`, un reintento con éxito y la apertura del breaker; primer token y huecos entre tokens del worker que sirve; la recuperación da `half_open` y `closed`. Los logs `worker hung`, `request retried`, `breaker opened` (con `reason`), `breaker half-open`/`closed`, `worker draining`/`removed` aparecen. |
+| `TestObserverHealthAndRestart` | Healthchecks correctos y fallidos, reinicio detectado y apertura del breaker por salud, con sus logs. |
+
 `TestStressInvariants` tiene además un subtest `chaos`: las mismas 1.500 peticiones mientras una goroutine cambia los fallos de los workers al azar cada 3 ms (errores, caída, cuelgue, corte, parada, lentitud y reinicios), con healthchecks, breaker y reintentos activos. Comprueba las mismas invariantes (presupuesto nunca superado, un resultado por petición, cola y ledgers vacíos, sin goroutines vivas) y además que no queda ningún grant sin terminar.
 
 ### `internal/prefix` — hashes y radix tree
@@ -175,8 +183,23 @@ Usan workers simulados reales detrás de un servidor HTTP real:
 | `TestFailureBeforeFirstTokenGetsAStatusCode` | Con el único worker caído, streaming y no streaming responden `503 worker_unavailable` con `Retry-After`, sin cabeceras SSE (FI-9). |
 | `TestRetryIsInvisibleToTheClient` | Con un worker caído y otro sano, todas las respuestas son `200` completas y `X-Worker-Id` es el sano. |
 | `TestNoHealthyWorkers` | Cuando los healthchecks marcan el único worker, la respuesta es `503 no_healthy_workers` con `Retry-After`. |
+| `TestRequestOutcomes` | Cada camino acaba en su `outcome` (completada, modelo desconocido como `unknown`, JSON inválido, demasiado grande, worker caído, corte a mitad de stream con y sin streaming), con sus tokens y su TTFT. |
+| `TestClientRequestID` | Un `X-Request-Id` válido se usa como ID (cabecera y chunks); uno con espacios, demasiado largo o ausente se sustituye por uno generado. |
+
+### `internal/metrics` — catálogo y valores (Fase 5)
+
+Montan las piezas reales como `cmd/platform` (workers simulados, scheduler y API, todos informando a un `Metrics`):
+
+| Test | Qué garantiza |
+| :--- | :--- |
+| `TestCatalogue` | Con tráfico que toca todas las áreas, **cada métrica de la guía 12 existe**, pasa el *linter* de Prometheus (`GatherAndLint`) y tiene valores coherentes (las peticiones reintentadas cuentan como `completed`, el modelo desconocido como `unknown`, la concurrencia vuelve a 0); `/metrics` sirve el formato de texto. |
+| `TestHistogramsObserveBothTTFTs` | Una petición da un TTFT del cliente, uno del worker, un hueco entre tokens por token y una latencia total. |
+| `TestQueueMetrics` | Una petición que espera da una admisión `queued` y una observación de espera en cola. |
+| `TestEventCountersStartAtZero` | Los contadores de eventos existen a 0 desde el primer *scrape*, para que `increase()` vea el primer evento. |
 
 ### Huecos conocidos
+
+- El stack de observabilidad (Dockerfile, compose, dashboard) no tiene tests automáticos. Se validó al cerrar la Fase 5: `promtool check config`/`check rules`, cada consulta del dashboard contra Prometheus tras una prueba con `loadgen`, y revisión visual de una captura.
 
 - `internal/tokens` no tiene tests (0 % de cobertura).
 - La comparación de colocaciones (TTFT, acierto de caché) se mide con `loadgen` contra el binario, no con un test: depende de tiempos reales.
@@ -184,6 +207,6 @@ Usan workers simulados reales detrás de un servidor HTTP real:
 - La comprobación del pico de reserva sigue siendo por muestreo (después de cada concesión), tanto en `simworker` como en el test de estrés del scheduler.
 - La prueba del binario completo (arrancarlo y lanzar peticiones con `curl`) se hizo a mano; un test *end-to-end* en Go que arranque el servidor sería la forma portable de automatizarla.
 - No hay un test que fuerce el vencimiento del TTL *después* de salir de la cola; el camino normal (cola → handler con TTL activo) sí está cubierto.
-- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Al cerrar la Fase 4 (2026-11-18) también, incluido el estrés con caos. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
+- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Al cerrar la Fase 4 (2026-11-18) también, incluido el estrés con caos, y al cerrar la Fase 5 (2026-11-18) también, con `client_golang` incluido. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
 
 La estrategia de tests de la Fase 2 (contrato, estrés con invariantes y generador de carga) está en [08 · Decisión 7](08-fase-2-decisiones.md#decisión-7-tests-carga-y-métricas-mínimas).

@@ -19,6 +19,7 @@ Solo se implementa el subconjunto que el control plane necesita hoy.
 | `GET /debug/workers` | Array de `WorkerSnapshot` (presupuesto, reservado, leases activos, concedidos, rechazados y, con caché de prefijos, `prefix_cache_blocks`, `prefix_cache_used`, `prefix_blocks_queried` y `prefix_blocks_hit`). |
 | `GET /debug/scheduler` | Estado de la admisión: peticiones y tokens en cola por modelo, límite de la cola, edad de la cabeza, admitidas (directas y desde la cola), rechazos por motivo, despertares con barrera y tiempo en cola p50/p99. Con `-placement prefix`, un bloque `placement` con los contadores de afinidad y el tamaño del radix tree ([09 · Métricas](09-fase-3-routing-por-prefijos.md#métricas)). |
 | `GET /healthz` | `200 ok` (liveness). |
+| `GET /metrics` | Métricas en formato Prometheus (Fase 5). Lo sirve `cmd/platform`; catálogo en [12 · Observabilidad](12-observabilidad.md#catálogo-de-métricas). |
 
 `/debug/workers` incluye desde la Fase 4 un objeto `status` por worker: `state` (`active`/`draining`), `healthy`, `breaker` (`closed`/`open`/`half-open`), `degraded`, `itl_ms`, `in_flight`, `failures`, `breaker_opens` e `instance_id`. `/debug/scheduler` añade `worker_failures`, `ttft_timeouts`, `stall_timeouts`, `retries`, `retry_successes`, `breaker_opens`, `restarts_detected` y `rejected_no_healthy_workers`.
 
@@ -143,6 +144,9 @@ Los sirve `cmd/platform` (no `httpapi`), porque crean y rompen workers **simulad
 | `RetryAfter` | 1 s | Valor de reserva de la cabecera si el scheduler no aporta uno. |
 | `StreamBuffer` | 16 | Buffer del canal worker → handler. |
 | `MaxBodyBytes` | 4 MB | Tamaño máximo del cuerpo. |
+| `Observer` | ninguno | Recibe un registro por petición (`outcome`, TTFT, tokens) para las métricas (Fase 5). |
+
+**`X-Request-Id`** (Fase 5): si el cliente lo envía con 1–64 caracteres `[A-Za-z0-9._-]`, se usa como ID de la petición (logs, cabecera de respuesta y `id` de los chunks); si no, se genera uno (`chatcmpl-…`). Se devuelve en todas las respuestas, también en las de error.
 
 ## Ejemplos
 
