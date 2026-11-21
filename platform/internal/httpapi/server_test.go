@@ -513,3 +513,39 @@ func TestClientRequestID(t *testing.T) {
 		}
 	}
 }
+
+// With -admin-addr the debug routes live on their own mux (Phase 7, FI-10):
+// the public one must not serve them.
+func TestPublicAndDebugRoutesSplit(t *testing.T) {
+	w, err := simworker.New(simworker.Config{ID: "w1", Models: []string{model}, TokenBudget: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := scheduler.New(scheduler.Config{}, w)
+	t.Cleanup(sched.Close)
+	api := New(sched, DefaultConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	public, debug := http.NewServeMux(), http.NewServeMux()
+	api.RegisterPublic(public)
+	api.RegisterDebug(debug)
+
+	cases := []struct {
+		mux  *http.ServeMux
+		path string
+		want int
+	}{
+		{public, "/healthz", http.StatusOK},
+		{public, "/v1/models", http.StatusOK},
+		{public, "/debug/workers", http.StatusNotFound},
+		{public, "/debug/scheduler", http.StatusNotFound},
+		{debug, "/debug/workers", http.StatusOK},
+		{debug, "/debug/scheduler", http.StatusOK},
+		{debug, "/v1/models", http.StatusNotFound},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		c.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, c.path, nil))
+		if rec.Code != c.want {
+			t.Errorf("GET %s on the %s mux = %d, want %d", c.path, map[bool]string{true: "public", false: "debug"}[c.mux == public], rec.Code, c.want)
+		}
+	}
+}

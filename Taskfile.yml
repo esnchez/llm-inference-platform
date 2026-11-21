@@ -16,6 +16,12 @@ vars:
   # Real vLLM on CPU (Phase 6b-CPU): pinned image and model.
   VLLM_CPU_IMAGE: vllm/vllm-openai-cpu:v0.34.0-x86_64
   VLLM_CPU_MODEL: Qwen/Qwen2.5-0.5B-Instruct
+  # Local Kubernetes (Phase 7): a dedicated minikube profile, so no other
+  # cluster on the machine is touched. Every command names its context.
+  K8S_PROFILE: llm-platform
+  K8S_NS: llm
+  KEDA_VERSION: 2.21.1
+  CHART_DIR: deploy/helm/llm-platform
 
 tasks:
   default:
@@ -81,6 +87,44 @@ tasks:
     desc: Stop and remove the observability stack, either variant (its data is not kept)
     cmds:
       - docker compose --profile two -f {{.STACK_FILE}} -f {{.STACK_VLLM_CPU}} down --remove-orphans
+
+  # ---- local Kubernetes (Phase 7, docs/servicio/16) ----
+
+  k8s:up:
+    desc: "Start minikube (profile llm-platform), load the images, install KEDA and the chart (extra helm flags: task k8s:up -- --set vllmCpu.enabled=true)"
+    cmds:
+      - minikube status -p {{.K8S_PROFILE}} >/dev/null 2>&1 || minikube start -p {{.K8S_PROFILE}} --driver=docker --cpus=6 --memory=10240
+      - docker build -t llm-platform:dev {{.PLATFORM_DIR}}
+      - docker build -t llm-fakevllm:dev --build-arg CMD=fakevllm {{.PLATFORM_DIR}}
+      - minikube -p {{.K8S_PROFILE}} image load --overwrite llm-platform:dev
+      - minikube -p {{.K8S_PROFILE}} image load --overwrite llm-fakevllm:dev
+      - helm repo add kedacore https://kedacore.github.io/charts --force-update
+      - helm --kube-context {{.K8S_PROFILE}} upgrade --install keda kedacore/keda --version {{.KEDA_VERSION}} -n keda --create-namespace --wait
+      - >-
+        helm --kube-context {{.K8S_PROFILE}} upgrade --install llm-platform {{.CHART_DIR}} -n {{.K8S_NS}} --create-namespace --wait
+        --set-file grafana.dashboard=deploy/observability/grafana/dashboards/llm-platform-overview.json
+        --set-file prometheus.alerts=deploy/observability/prometheus/alerts.yml {{.CLI_ARGS}}
+      # Same tag, new image: restart so the pods pick it up.
+      - kubectl --context {{.K8S_PROFILE}} -n {{.K8S_NS}} rollout restart deployment/platform deployment/fakevllm
+      - kubectl --context {{.K8S_PROFILE}} -n {{.K8S_NS}} get pods
+
+  k8s:port-forward:
+    desc: "Expose the API (8080), the admin port (localhost:18081; 8081 is often reserved on Windows) and Grafana (3000) on localhost; Ctrl+C stops"
+    cmds:
+      - >-
+        kubectl --context {{.K8S_PROFILE}} -n {{.K8S_NS}} port-forward svc/grafana 3000:3000 &
+        kubectl --context {{.K8S_PROFILE}} -n {{.K8S_NS}} port-forward svc/platform-admin 18081:8081 &
+        kubectl --context {{.K8S_PROFILE}} -n {{.K8S_NS}} port-forward svc/platform 8080:8080
+
+  k8s:status:
+    desc: Pods, the KEDA ScaledObject and its HPA, and the workers the platform registered
+    cmds:
+      - kubectl --context {{.K8S_PROFILE}} -n {{.K8S_NS}} get pods,scaledobject,hpa
+
+  k8s:down:
+    desc: Delete the minikube profile llm-platform (cluster and data)
+    cmds:
+      - minikube delete -p {{.K8S_PROFILE}}
 
   stack:logs:
     desc: Follow the platform's JSON logs in the stack

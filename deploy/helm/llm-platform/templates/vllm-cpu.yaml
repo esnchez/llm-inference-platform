@@ -1,0 +1,68 @@
+{{- if .Values.vllmCpu.enabled }}
+# Real vLLM on CPU (Phase 6b-CPU). One replica, not autoscaled: a ~6 min
+# warm-up makes scaling it on demand useless. The model is cached in a PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cpu-cache
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.vllmCpu.cacheSize }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-cpu
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: vllm-cpu
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # the PVC is ReadWriteOnce
+  selector:
+    matchLabels: {app.kubernetes.io/name: vllm-cpu}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: vllm-cpu}
+    spec:
+      containers:
+        - name: vllm
+          image: {{ .Values.vllmCpu.image }}
+          imagePullPolicy: IfNotPresent
+          args: [{{ .Values.vllmCpu.model | quote }}, "--dtype", "float32",
+                 "--max-model-len", {{ .Values.vllmCpu.maxModelLen | quote }},
+                 "--kv-cache-memory-bytes", {{ .Values.vllmCpu.kvCacheBytes | quote }}]
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          startupProbe: # up to 20 min to download and warm up
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 120
+          volumeMounts:
+            - {name: cache, mountPath: /root/.cache/huggingface}
+            - {name: shm, mountPath: /dev/shm}
+          resources: {{- toYaml .Values.vllmCpu.resources | nindent 12 }}
+      volumes:
+        - name: cache
+          persistentVolumeClaim: {claimName: vllm-cpu-cache}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-cpu
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/name: vllm-cpu}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+{{- end }}

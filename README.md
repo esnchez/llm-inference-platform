@@ -33,7 +33,7 @@ Durante la fase de diseño se identificaron varios cuellos de botella clásicos 
 | **Contrato de Inferencia** | Petición/Respuesta unaria y bloqueante (`Infer`). | **Streaming-First** (`InferStream`). | El 95% del tráfico LLM es streaming. Empezar con streaming evita reescribir todo el manejo de red, buffers y cancelaciones más adelante. |
 | **Control de Admisión** | Snapshot de capacidad -> Selección (Condición de carrera). | **Leases Atómicos** (`AcquireLease`). | Evita que dos peticiones reclamen la misma capacidad simultáneamente. Un *lease* garantiza los recursos antes de iniciar el streaming. |
 | **Unidad de Capacidad** | Peticiones en vuelo (`in_flight / max_concurrency`). | **Presupuesto de Tokens / VRAM**. | Las peticiones LLM tienen costes asimétricos. Un prompt de 8K tokens satura la VRAM mucho antes que 10 prompts de 100 tokens. |
-| **Algoritmo de Routing** | *Least-loaded* (Menor carga de conexiones). | **Prefix-Aware / Affinity Routing**. | *Least-loaded* destruye la localidad del KV-Cache (aumenta el TTFT un 80%). Usamos un Radix Tree para enviar peticiones al nodo que ya tiene ese contexto procesado. |
+| **Algoritmo de Routing** | *Least-loaded* (Menor carga de conexiones). | **Prefix-Aware / Affinity Routing**. | *Least-loaded* destruye la localidad del KV-Cache. Medido en este proyecto, frente a round-robin: TTFT p50 ×3,6 peor en el simulador ([Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md#mediciones)) y ×5 con vLLM real en CPU ([Fase 6b-CPU](docs/servicio/14-fase-6b-cpu-decisiones.md#resultados-del-benchmark-y-de-las-mediciones)). Usamos un Radix Tree para enviar peticiones al nodo que ya tiene ese contexto procesado. |
 | **Autoscaling (Futuro)** | Basado en utilización de CPU o tráfico HTTP (HPA). | **Basado en Saturación de Cache**. | En LLMs, la GPU puede estar al 100% de cómputo con 1 request o con 64. Escalaremos leyendo `vllm:gpu_cache_usage_factor` y `vllm:num_requests_waiting` (nombre de métrica pendiente de corregir, ver [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm)). |
 | **Contabilidad de Capacidad** | Ocupación real de KV-Cache del motor. | **Reserva pesimista** (`prompt + max_new_tokens`) en el plano de control. | Simple, segura y atómica sin API de reserva en vLLM. Infrautiliza la GPU; ver [FI-1](#fi-1-reserva-pesimista-de-capacidad). |
 | **Espera ante saturación** | Rechazo inmediato (`503`) o cola ilimitada. | **Cola acotada por modelo** con timeout corto, adelantamiento acotado y barrera FIFO. | En LLM la capacidad se libera de forma continua: una cola corta absorbe picos, y acotarla por tokens y por tiempo evita la latencia descontrolada. Ver [decisiones de la Fase 2](docs/servicio/08-fase-2-decisiones.md). |
@@ -142,7 +142,7 @@ Esto valida el encolado, la concurrencia, los data races y la resiliencia del Co
 
 Cuando la arquitectura se despliegue en producción con **vLLM**:
 1. **Mitigación del Cold Start:** Los pods de vLLM no descargarán pesos desde internet. Se usarán volúmenes compartidos (ej. `ReadWriteMany` / hostPath cache) para mapear los 15-30GB de modelos directamente en la memoria del contenedor al arrancar.
-2. **K8s Custom Operator:** Un operador en Go leerá las métricas de saturación desde Prometheus y actuará escalando los Node Pools de GPU y los Pods, mucho antes de que el throughput empiece a degradarse.
+2. **Autoscaling por métricas de inferencia:** escalar los Pods (y los Node Pools de GPU) a partir de la saturación que ve la plataforma, no de la CPU. En la Fase 7 lo hace **KEDA** con una consulta de Prometheus en lugar de un operador propio ([decisiones](docs/servicio/16-fase-7-decisiones.md)).
 3. **vLLM Adapter:** El `SimulatedWorker` será reemplazado por un cliente gRPC/HTTP bidireccional conectado al servidor vLLM real.
 
 ---
@@ -216,12 +216,14 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Prueba de humo repetible (`task vllm-cpu:smoke`) y stack con vLLM en CPU (`task stack:up:vllm-cpu`).
 - [x] Mediciones relativas (FI-1, FI-3, FI-6) y benchmark router frente a round-robin: con vLLM real, la afinidad sube el acierto de caché del 53 % al 75 % y baja el TTFT mediano ~5× (relativo, en CPU).
 
-### Fase 7 — Kubernetes Operator (Autoscaling)
-> Revisar antes de empezar: [FI-2](#fi-2-plano-de-control-con-más-de-una-réplica).
+### Fase 7 — Kubernetes en local (Autoscaling)
+> En minikube, sin GPUs. Una réplica del plano de control con `Recreate` ([FI-2](#fi-2-plano-de-control-con-más-de-una-réplica)). Decisiones y resultados: [`docs/servicio/16-fase-7-decisiones.md`](docs/servicio/16-fase-7-decisiones.md).
 
-- [ ] Despliegue mediante Helm.
-- [ ] ~~Configuración del almacenamiento compartido para pesos (Cold start reduction).~~ Sin GPUs pierde sentido: basta el volumen de caché del modelo (`vllm-hf-cache`) de la Fase 6b-CPU.
-- [ ] Desarrollo de controlador custom para autoescalar pods basado en métricas nativas (`gpu_cache_usage_factor`, ver [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm)).
+- [x] Despliegue mediante Helm (`deploy/helm/llm-platform`, `task k8s:up`): plataforma, vLLM falsos, vLLM en CPU opcional, Prometheus y Grafana con el mismo dashboard y alertas.
+- [x] Descubrimiento de workers por el DNS de un Service *headless* (`-vllm-dns`); las bajas se drenan sin cortar streams.
+- [x] Puerto de administración separado (`-admin-addr`, [FI-10](#fi-10-metrics-debug-y-la-administración-comparten-puerto-con-la-api-pública)).
+- [ ] ~~Configuración del almacenamiento compartido para pesos (Cold start reduction).~~ Sin GPUs pierde sentido: basta el volumen de caché del modelo de la Fase 6b-CPU (un PVC en el chart).
+- [x] ~~Desarrollo de controlador custom~~ **KEDA** autoescala los vLLM falsos con la demanda en tokens que ve la plataforma (reservado + en cola). Sustituye al operador propio: mismo resultado, sin CRDs ni `client-go`.
 
 ---
 
@@ -249,6 +251,13 @@ task stack:down
 
 # Contra servidores vLLM (Fase 6a/6b): se registran solos cuando han cargado el modelo
 task run -- -workers 0 -vllm http://gpu-1:8000,http://gpu-2:8000
+
+# Kubernetes en local (Fase 7; minikube, Helm): perfil propio llm-platform, no toca otros clústeres
+task k8s:up                         # clúster, imágenes, KEDA y el chart (vLLM en CPU: -- --set vllmCpu.enabled=true)
+task k8s:port-forward               # API :8080, Grafana :3000, admin (/metrics, /debug) :18081
+task loadgen -- -rate 4 -duration 180s -prefixes 8   # KEDA añade vLLM falsos; al parar, los quita drenando
+task k8s:status                     # pods, ScaledObject y HPA
+task k8s:down                       # borra el perfil
 ```
 
 **Suite de tests** (definida en `Taskfile.yml`; `task --list` muestra todas las tareas):
@@ -333,7 +342,8 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
   - Estado compartido (Redis/etcd) con operaciones atómicas, aceptando la latencia extra y la dependencia que hoy se excluye en *No objetivos*.
   - Admisión en el propio worker: un sidecar junto a cada vLLM es la fuente de verdad del presupuesto y las réplicas solo enrutan.
   - Leases con renovación (*heartbeat*) para recuperar la capacidad si la réplica que los emitió muere a mitad de stream.
-- **Revisar:** antes del despliegue en Kubernetes (Fase 7), o antes si se necesita alta disponibilidad.
+- **Fase 7:** se despliega una réplica con estrategia `Recreate`, para que ni siquiera durante una actualización haya dos *ledgers* a la vez; el precio es un corte breve en cada despliegue ([decisión 7](docs/servicio/16-fase-7-decisiones.md#decisión-7-una-réplica-con-recreate-fi-2)).
+- **Revisar:** si se necesita alta disponibilidad o más throughput del que da una réplica.
 
 ### FI-3. Estimación de tokens sin tokenizer
 - **Decisión actual:** `internal/tokens.Estimate` aproxima ~4 caracteres por token.
@@ -386,4 +396,4 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Decisión actual:** `cmd/platform` sirve en el mismo puerto la API, `GET /metrics` (Fase 5), `/debug/scheduler`, `/debug/workers` y los endpoints que dan de alta, de baja, rompen y reinician workers simulados (Fase 4).
 - **Problema:** cualquiera que llegue a la API puede leer las métricas y el estado interno, y alterar el pool. Aceptable en local; inaceptable expuesto.
 - **Opciones:** un segundo *listener* (`-admin-addr`) solo accesible dentro del clúster para `/metrics` y `/debug/*`; o autenticación en esas rutas. Con vLLM, los endpoints que rompen workers simulados desaparecen.
-- **Revisar:** antes de desplegar (Fase 7).
+- **Resuelto en la Fase 7:** con `-admin-addr`, `/metrics`, `/debug/*` y la administración se sirven solo en ese puerto; en Kubernetes el Service público expone solo la API. Sin el flag todo sigue en un puerto (uso local). Queda abierto: el puerto de administración no tiene autenticación, su protección es la red del clúster.

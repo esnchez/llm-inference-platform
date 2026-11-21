@@ -245,9 +245,9 @@ Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_g
 | Hoy (en memoria) | Futuro |
 | :--- | :--- |
 | `simworker.Worker` en el mismo proceso | **Hecho (6a/6b-CPU):** `vllm.Worker` habla por HTTP con vLLM; probado con el falso y con **vLLM 0.34 real en CPU** (no se probará en GPUs). |
-| Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el *watch* de los Endpoints de Kubernetes (Fase 7). |
+| Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el DNS de un Service *headless* (Fase 7, `-vllm-dns`; se descartó el *watch* de la API por sus dependencias y permisos). |
 | Healthchecks contra `simworker.Health` | `GET /health` de vLLM desde el `VLLMAdapter` (Fase 6). |
-| `/metrics` y `/debug` en el puerto de la API | Puerto de administración solo accesible dentro del clúster (FI-10, Fase 7). |
+| `/metrics` y `/debug` en el puerto de la API | Puerto de administración solo accesible dentro del clúster (FI-10, Fase 7, `-admin-addr`). |
 | Stack local con `docker-compose` (`deploy/observability`) | Prometheus y Grafana del clúster; el dashboard JSON se reutiliza. |
 | `PrefixAffinity` aproxima las cachés con su propio árbol LRU (Fase 3) | Corregirlo con eventos de KV-Cache de vLLM, si la versión fijada los publica (Fase 6). |
 | Caché de prefijos simulada en `simworker` | *Automatic prefix caching* de vLLM; `PrefixHashes` deja de usarse en el worker. |

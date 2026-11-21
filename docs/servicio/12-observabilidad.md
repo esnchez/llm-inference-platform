@@ -52,7 +52,7 @@ Ficheros (`deploy/observability/`): `docker-compose.yml`, `prometheus/prometheus
 
 | Servicio | URL | Para qué |
 | :--- | :--- | :--- |
-| Plataforma | `http://localhost:8080` | API, `/metrics`, `/debug/*` |
+| Plataforma | `http://localhost:8080` | API, `/metrics`, `/debug/*` (en Kubernetes, `/metrics` y `/debug/*` van al puerto de administración: `localhost:18081` con `task k8s:port-forward`, [16](16-fase-7-decisiones.md)) |
 | Prometheus | `http://localhost:9090` | Consultas PromQL sueltas, estado del *scrape* (`/targets`) |
 | Grafana | `http://localhost:3000` | Dashboard **LLM Platform · Overview**, página de inicio (acceso anónimo de solo lectura; `admin`/`admin` para editar) |
 | Alertas | `http://localhost:9090/alerts` | Estado de las reglas de ejemplo (sin Alertmanager: no avisan a nadie) |
@@ -464,4 +464,4 @@ Desde la Fase 6a, el dashboard tiene una fila **6 · Motor (vLLM)** con la compa
 - **Resolución de 5 s.** Un pico más corto que el intervalo de *scrape* se ve atenuado en `rate()`.
 - **Contadores que se reinician** al reiniciar el proceso: `rate()` e `increase()` lo gestionan, pero los totales acumulados en `/debug` empiezan de cero.
 - **Una réplica** (FI-2): con varias, cada una expone sus propias métricas y hay que agregarlas con `sum`; los histogramas y los contadores se agregan bien precisamente por eso (decisión 4).
-- **`/metrics` en el puerto público** (FI-10): aceptable en local, a separar antes de desplegar.
+- **`/metrics` en el puerto público** (FI-10): aceptable en local. Resuelto con `-admin-addr` en la Fase 7: en Kubernetes, `/metrics` solo está en el puerto de administración.

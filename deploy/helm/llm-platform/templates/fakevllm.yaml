@@ -1,0 +1,51 @@
+{{- if .Values.fakevllm.enabled }}
+# Fake vLLM servers (cmd/fakevllm): what KEDA scales. The platform finds them
+# through the headless Service below (decision 3).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakevllm
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: fakevllm
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.fakevllm.replicas }}
+  {{- end }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: fakevllm}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fakevllm}
+    spec:
+      # On SIGTERM the fake turns unhealthy and finishes its streams
+      # (decision 4); this must exceed its -shutdown-grace.
+      terminationGracePeriodSeconds: {{ .Values.fakevllm.terminationGracePeriodSeconds }}
+      containers:
+        - name: fakevllm
+          image: {{ .Values.fakevllm.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          args:
+            - -addr=:8000
+            {{- range .Values.fakevllm.args }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: 8000}
+          # Ready = model loaded: only then is the pod in the DNS answer.
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 2
+          resources: {{- toYaml .Values.fakevllm.resources | nindent 12 }}
+---
+# Headless: the DNS name answers with one A record per ready pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakevllm
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/name: fakevllm}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+{{- end }}

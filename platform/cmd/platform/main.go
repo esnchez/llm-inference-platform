@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ func main() {
 func run() error {
 	var (
 		addr          = flag.String("addr", ":8080", "HTTP listen address")
+		adminAddr     = flag.String("admin-addr", "", "separate listen address for /metrics and /debug/* (e.g. :8081); empty = everything on -addr")
 		numWorkers    = flag.Int("workers", 3, "number of simulated workers")
 		models        = flag.String("models", "sim-llama-3-8b", "comma-separated models served by every worker")
 		budget        = flag.Int("token-budget", 16384, "simulated KV-cache budget per worker, in tokens")
@@ -62,6 +64,8 @@ func run() error {
 		vllmURLs      = flag.String("vllm", "", "comma-separated vLLM server URLs (e.g. http://gpu-1:8000); each is registered once it is ready. Combine with -workers 0 for vLLM only")
 		vllmKey       = flag.String("vllm-api-key", os.Getenv("VLLM_API_KEY"), "API key sent to vLLM as a Bearer token (default $VLLM_API_KEY)")
 		vllmBudget    = flag.Int("vllm-token-budget", 0, "token budget of each vLLM worker; 0 = discover it from vllm:cache_config_info")
+		vllmDNS       = flag.String("vllm-dns", "", "comma-separated host:port names re-resolved every -vllm-dns-interval; every IP is a vLLM server (Kubernetes headless Service)")
+		vllmDNSEvery  = flag.Duration("vllm-dns-interval", 10*time.Second, "how often -vllm-dns names are resolved")
 	)
 	flag.Parse()
 
@@ -134,16 +138,28 @@ func run() error {
 	pool.sched = sched
 	api := httpapi.New(sched, cfg, log)
 
+	// Public routes on -addr. The internal ones (metrics, debug, simulated
+	// worker administration) go on -admin-addr when it is set, so that the
+	// public Service does not expose them (Phase 7, FI-10).
 	mux := http.NewServeMux()
-	mux.Handle("/", api.Handler())
-	mux.Handle("GET /metrics", mtr.Handler()) // same port as the API for now (README §9, FI-10)
-	pool.register(mux)                        // POST/DELETE /debug/workers...: add, drain, break, restart
+	api.RegisterPublic(mux)
+	adminMux := mux
+	if *adminAddr != "" {
+		adminMux = http.NewServeMux()
+	}
+	api.RegisterDebug(adminMux)
+	adminMux.Handle("GET /metrics", mtr.Handler())
+	pool.register(adminMux) // POST/DELETE /debug/workers...: add, drain, break, restart
 
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: it would cut long-lived SSE streams.
+	}
+	servers := []*http.Server{srv}
+	if *adminAddr != "" {
+		servers = append(servers, &http.Server{Addr: *adminAddr, Handler: adminMux, ReadHeaderTimeout: 10 * time.Second})
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -162,13 +178,29 @@ func run() error {
 		}
 		go c.Run(ctx)
 	}
+	// Phase 7: vLLM servers discovered by DNS (one IP per ready pod).
+	for _, hp := range strings.Split(*vllmDNS, ",") {
+		if hp = strings.TrimSpace(hp); hp == "" {
+			continue
+		}
+		host, port, err := net.SplitHostPort(hp)
+		if err != nil {
+			return fmt.Errorf("-vllm-dns %q: %w", hp, err)
+		}
+		d := &vllm.DNSWatcher{
+			Host: host, Port: port, Interval: *vllmDNSEvery, Registry: sched,
+			Template: vllm.Config{APIKey: *vllmKey, TokenBudget: *vllmBudget, LeaseTTL: *leaseTTL},
+			Log:      log.With("component", "vllm-connector"),
+		}
+		go d.Run(ctx)
+	}
 
-	errc := make(chan error, 1)
-	go func() {
-		log.Info("platform listening", "addr", *addr, "workers", *numWorkers, "vllm", *vllmURLs, "models", modelList,
-			"token_budget", *budget, "placement", *placement, "prefix_cache_blocks", cacheBlocks)
-		errc <- srv.ListenAndServe()
-	}()
+	errc := make(chan error, len(servers))
+	log.Info("platform listening", "addr", *addr, "admin_addr", *adminAddr, "workers", *numWorkers, "vllm", *vllmURLs,
+		"vllm_dns", *vllmDNS, "models", modelList, "token_budget", *budget, "placement", *placement, "prefix_cache_blocks", cacheBlocks)
+	for _, s := range servers {
+		go func() { errc <- s.ListenAndServe() }()
+	}
 
 	select {
 	case err := <-errc:
@@ -179,6 +211,9 @@ func run() error {
 	log.Info("shutting down", "grace", shutdownGrace.String())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
 	defer cancel()
+	if len(servers) > 1 {
+		go func() { _ = servers[1].Shutdown(shutdownCtx) }() // metrics until the end
+	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		// Grace period over: drop the remaining streams (their contexts are
 		// cancelled, which releases their leases).

@@ -1,0 +1,69 @@
+{{- $ns := .Release.Namespace -}}
+{{- $dns := list -}}
+{{- if .Values.fakevllm.enabled }}{{ $dns = append $dns (include "llm-platform.dns" (dict "name" "fakevllm" "ns" $ns)) }}{{ end -}}
+{{- if .Values.vllmCpu.enabled }}{{ $dns = append $dns (include "llm-platform.dns" (dict "name" "vllm-cpu" "ns" $ns)) }}{{ end -}}
+# The control plane (decision 7): ONE replica and Recreate, so that there are
+# never two ledgers in front of the same workers (FI-2). The cost is a short
+# outage on every rollout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: platform
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app.kubernetes.io/name: platform}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: platform}
+    spec:
+      # > -shutdown-grace (15 s): streams in flight finish on a rollout.
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: platform
+          image: {{ .Values.platform.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          args:
+            - -addr=:8080
+            - -admin-addr=:8081 # metrics and /debug/* off the public Service (FI-10)
+            - -workers=0
+            - -vllm-dns={{ join "," $dns }}
+            {{- range .Values.platform.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: admin, containerPort: 8081}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources: {{- toYaml .Values.platform.resources | nindent 12 }}
+---
+# Public entry point: the API only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: platform}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# Internal: /metrics (Prometheus) and /debug/*. Reach it with port-forward.
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-admin
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: platform}
+  ports:
+    - {name: admin, port: 8081, targetPort: admin}

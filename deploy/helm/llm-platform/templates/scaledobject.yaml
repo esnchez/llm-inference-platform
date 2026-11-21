@@ -1,0 +1,31 @@
+{{- if and .Values.fakevllm.enabled .Values.autoscaling.enabled }}
+# Autoscaling (decision 5): KEDA reads the token demand the platform sees,
+# reserved now plus waiting in the queue, and asks for
+# ceil(demand / targetTokens) fake vLLM replicas. `or vector(0)` keeps the
+# query defined when there are no workers or no queues yet.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fakevllm
+  labels: {{- include "llm-platform.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: fakevllm
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  pollingInterval: {{ .Values.autoscaling.pollingInterval }}
+  cooldownPeriod: {{ .Values.autoscaling.cooldownPeriod }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.scaleDownStabilizationSeconds }}
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.{{ .Release.Namespace }}.svc.cluster.local:9090
+        query: >-
+          (sum(llmplatform_worker_tokens_reserved) or vector(0))
+          + (sum(llmplatform_queue_tokens) or vector(0))
+        threshold: {{ .Values.autoscaling.targetTokens | quote }}
+{{- end }}

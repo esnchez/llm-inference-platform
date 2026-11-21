@@ -44,6 +44,7 @@ type outcome struct {
 func main() {
 	var (
 		url       = flag.String("url", "http://localhost:8080", "platform base URL")
+		adminURL  = flag.String("admin-url", "", "base URL of /debug/* when the platform runs with -admin-addr; empty = -url")
 		model     = flag.String("model", "sim-llama-3-8b", "model to request")
 		rate      = flag.Float64("rate", 20, "mean arrival rate, requests per second (Poisson)")
 		duration  = flag.Duration("duration", 10*time.Second, "how long to send requests")
@@ -64,6 +65,10 @@ func main() {
 		chaosFor  = flag.Duration("chaos-for", 0, "how long it lasts; 0 = a third of -duration")
 	)
 	flag.Parse()
+	admin := *adminURL
+	if admin == "" {
+		admin = *url
+	}
 	if *rate <= 0 || *duration <= 0 {
 		fmt.Fprintln(os.Stderr, "loadgen: -rate and -duration must be positive")
 		os.Exit(2)
@@ -99,7 +104,7 @@ func main() {
 		if span <= 0 {
 			span = *duration / 3
 		}
-		if err := scheduleChaos(client, *url, *chaos, *chaosWkr, at, span); err != nil {
+		if err := scheduleChaos(client, admin, *chaos, *chaosWkr, at, span); err != nil {
 			fmt.Fprintln(os.Stderr, "loadgen:", err)
 			os.Exit(2)
 		}
@@ -132,8 +137,8 @@ func main() {
 	sendWindow := time.Since(start)
 	wg.Wait()
 	report(os.Stdout, outcomes, sent, sendWindow, time.Since(start))
-	printPrefixCache(os.Stdout, client, *url)
-	printSchedulerStats(os.Stdout, client, *url)
+	printPrefixCache(os.Stdout, client, admin)
+	printSchedulerStats(os.Stdout, client, admin)
 }
 
 // scheduleChaos breaks worker at the given offset and repairs it span

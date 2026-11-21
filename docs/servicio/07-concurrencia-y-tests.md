@@ -60,6 +60,7 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | `task check:all` | Antes de cerrar una fase: `check` + tests con `-race` en Docker. |
 | `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %; al cerrar la Fase 5: `metrics` 97 %, `scheduler` 94 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 92 %; al cerrar la Fase 6a: `httpapi` 93 %, `metrics` 94 %, `scheduler` 94 %, `simworker` 94 %, `vllm` 88 %, y `ledger` 98 % / `fakevllm` 83 % medidos con `-coverpkg`, porque los ejercitan los tests de otros paquetes). |
 | `task loadgen` | Generador de carga contra un servidor en marcha (no es un test: sirve para comparar configuraciones). |
+| CI (`.github/workflows/ci.yml`) | En cada *push* y *pull request*: `gofmt`, `go vet`, `go test -race -count=2` en Go 1.23 y `helm lint` del chart. |
 
 ### Batería de contrato común (`internal/workertest`, Fase 6a)
 
@@ -218,10 +219,14 @@ Montan las piezas reales como `cmd/platform` (workers simulados, scheduler y API
 | `TestCancellationAbortsTheEngineRequest` | Cancelar cierra la conexión y **el motor ve el aborto** (sin esto seguiría generando y ocupando VRAM). |
 | `TestHealthEngineStatsAndRestarts` | Ocupación, caché de prefijos y reinicios, con y sin `process_start_time_seconds`; `/health` fallando → no sano. |
 | `TestConnectorWaitsForTheModelThenRegisters` | El conector no registra mientras el modelo carga, registra después, y no vuelve a registrar un servidor que no cambió. |
+| `TestDNSWatcherFollowsTheAnswer` | Fase 7: el observador de DNS sigue la respuesta: alta de un segundo servidor, un error del resolvedor no da de baja a nadie, la IP que desaparece se da de baja (con el ID correcto) y `NXDOMAIN` vacía el pool. Usa dos vLLM falsos en `127.0.0.1` y `127.0.0.2` con el mismo puerto, como dos pods (se salta si el sistema no tiene `127.0.0.2`). |
+| `TestIsNotFound` | Solo `NXDOMAIN` cuenta como "no hay servidores"; un timeout no. |
 | `TestEndToEnd` | API + scheduler + adaptador + dos vLLM falsos, uno roto: todas las respuestas `200`, `usage` del motor (no la estimación), reintentos con éxito. |
 | `TestStressWithChaos` | 400 peticiones concurrentes contra 3 vLLM falsos que fallan, se cuelgan, cortan, emiten errores, se reinician y dejan de estar sanos: ningún ledger sobre su presupuesto, un resultado por petición, nada reservado ni en curso al final. |
 
-En `internal/httpapi` (Fase 6a): `TestParamsAreForwarded`, `TestUnsupportedParamsAreRejected`, `TestMessageContentMustBeAString`, `TestEngineUsageIsReported` (el `usage` del motor en la respuesta con y sin streaming, y en el registro de métricas) y `TestContextLength` (Fase 6b-CPU: un `max_tokens` que no cabe en `max_model_len` se recorta y se reserva lo recortado; un prompt que no cabe da `400` inmediato, sin cola).
+En `internal/httpapi` (Fase 6a): `TestParamsAreForwarded`, `TestUnsupportedParamsAreRejected`, `TestMessageContentMustBeAString`, `TestEngineUsageIsReported` (el `usage` del motor en la respuesta con y sin streaming, y en el registro de métricas) y `TestContextLength` (Fase 6b-CPU: un `max_tokens` que no cabe en `max_model_len` se recorta y se reserva lo recortado; un prompt que no cabe da `400` inmediato, sin cola). `TestPublicAndDebugRoutesSplit` (Fase 7, FI-10): con las rutas separadas, el mux público no sirve `/debug/*` y el de administración no sirve la API.
+
+En `internal/tokens`: `TestEstimate` (tabla de casos, caracteres frente a bytes) y `TestEstimateIsMonotonic`; 100 % de cobertura.
 
 **Contra vLLM real (Fase 6b-CPU):**
 
@@ -235,12 +240,12 @@ En `internal/httpapi` (Fase 6a): `TestParamsAreForwarded`, `TestUnsupportedParam
 
 - El stack de observabilidad (Dockerfile, compose, dashboard) no tiene tests automáticos. Se validó al cerrar la Fase 5: `promtool check config`/`check rules`, cada consulta del dashboard contra Prometheus tras una prueba con `loadgen`, y revisión visual de una captura.
 
-- `internal/tokens` no tiene tests (0 % de cobertura).
+- El chart de Helm solo tiene `helm lint` automático (en la CI); el despliegue, el autoscaling y el apagado ordenado del vLLM falso se validaron en minikube ([16](16-fase-7-decisiones.md#resultados-de-la-validación)).
 - La comparación de colocaciones (TTFT, acierto de caché) se mide con `loadgen` contra el binario, no con un test: depende de tiempos reales.
 - Los endpoints de administración de `cmd/platform` no tienen tests automáticos: se probaron a mano contra el binario (alta, fallos, campo desconocido, baja con drenaje, reinicio).
 - La comprobación del pico de reserva sigue siendo por muestreo (después de cada concesión), tanto en `simworker` como en el test de estrés del scheduler.
 - La prueba del binario completo (arrancarlo y lanzar peticiones con `curl`) se hizo a mano; un test *end-to-end* en Go que arranque el servidor sería la forma portable de automatizarla.
 - No hay un test que fuerce el vencimiento del TTL *después* de salir de la cola; el camino normal (cola → handler con TTL activo) sí está cubierto.
-- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Al cerrar la Fase 4 (2026-11-18) también, incluido el estrés con caos, y al cerrar la Fase 5 (2026-11-18) también, con `client_golang` incluido. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
+- `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Al cerrar la Fase 4 (2026-11-18) también, incluido el estrés con caos, y al cerrar la Fase 5 (2026-11-18) también, con `client_golang` incluido. Al cerrar la Fase 7 (2026-11-21) también, incluido el test del observador de DNS. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
 
 La estrategia de tests de la Fase 2 (contrato, estrés con invariantes y generador de carga) está en [08 · Decisión 7](08-fase-2-decisiones.md#decisión-7-tests-carga-y-métricas-mínimas).

@@ -1,0 +1,9 @@
+llm-platform installed in namespace {{ .Release.Namespace }}.
+
+Access (task k8s:port-forward does all three):
+  kubectl --context llm-platform -n {{ .Release.Namespace }} port-forward svc/platform 8080:8080
+  kubectl --context llm-platform -n {{ .Release.Namespace }} port-forward svc/grafana 3000:3000
+  kubectl --context llm-platform -n {{ .Release.Namespace }} port-forward svc/platform-admin 18081:8081
+
+Workers registered:  curl localhost:18081/debug/workers
+Autoscaling:         kubectl --context llm-platform -n {{ .Release.Namespace }} get scaledobject,hpa,pods -w

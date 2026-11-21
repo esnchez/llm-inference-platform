@@ -1,0 +1,9 @@
+apiVersion: v2
+name: llm-platform
+description: >-
+  Distributed LLM inference platform (Phase 7): the control plane, fake vLLM
+  servers scaled by KEDA, optional vLLM on CPU, Prometheus and Grafana.
+  Local use on minikube; see docs/servicio/16-fase-7-decisiones.md.
+type: application
+version: 0.1.0
+appVersion: "dev"

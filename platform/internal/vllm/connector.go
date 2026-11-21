@@ -27,6 +27,10 @@ type Connector struct {
 	// MinBackoff, MaxBackoff bound the retry delay; Recheck is the
 	// rediscovery period. Defaults: 1s, 30s, 30s.
 	MinBackoff, MaxBackoff, Recheck time.Duration
+	// RemoveOnStop removes (drains) the registered worker when Run returns.
+	// The DNS watcher sets it: its connectors stop when the server leaves
+	// the DNS answer (Phase 7).
+	RemoveOnStop bool
 }
 
 // Run blocks until ctx is cancelled.
@@ -44,6 +48,11 @@ func (c *Connector) Run(ctx context.Context) {
 		c.Log = slog.Default()
 	}
 	var current *Worker
+	defer func() {
+		if c.RemoveOnStop && current != nil {
+			_ = c.Registry.RemoveWorker(current.ID())
+		}
+	}()
 	backoff := c.MinBackoff
 	for {
 		info, err := Discover(ctx, c.Config)

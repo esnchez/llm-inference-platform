@@ -2,7 +2,7 @@
 
 Este documento resume **por qué el sistema es como es**, **qué se ha demostrado y con qué pruebas**, **cuáles son sus puntos fuertes y sus limitaciones**, y **qué faltaría para servir LLMs en producción con GPUs**. Sirve para defender el proyecto: cada afirmación enlaza con la decisión y la medición que la respaldan.
 
-> **Fecha:** 2026-11-21, al cerrar la Fase 6b-CPU. **Restricción del proyecto:** no se ha probado ni se probará en GPUs. Toda la evidencia viene del simulador, de un vLLM falso y de **vLLM 0.34 real en CPU** con un modelo de 0,5B parámetros.
+> **Fecha:** 2026-11-21, al cerrar la Fase 7 (Kubernetes en local). **Restricción del proyecto:** no se ha probado ni se probará en GPUs. Toda la evidencia viene del simulador, de un vLLM falso y de **vLLM 0.34 real en CPU** con un modelo de 0,5B parámetros.
 
 ## Índice
 
@@ -36,9 +36,10 @@ flowchart LR
 
 | Dato | Valor |
 | :--- | :--- |
-| Código | ~10 000 líneas de Go, una dependencia externa (`prometheus/client_golang`) |
-| Tests | 114 funciones de test, `-race -count=5` en Go 1.23, estrés con caos, batería de contrato común a todos los workers, tests contra respuestas reales de vLLM |
-| Fases | 1 Streaming y leases · 2 Colas y *load shedding* · 3 Routing por prefijos · 4 Resiliencia · 5 Observabilidad · 6a Adaptador vLLM · 6b-CPU vLLM real en CPU |
+| Código | ~11 000 líneas de Go, una dependencia externa (`prometheus/client_golang`) |
+| Tests | 119 funciones de test, `-race -count=5` en Go 1.23, estrés con caos, batería de contrato común a todos los workers, tests contra respuestas reales de vLLM |
+| Fases | 1 Streaming y leases · 2 Colas y *load shedding* · 3 Routing por prefijos · 4 Resiliencia · 5 Observabilidad · 6a Adaptador vLLM · 6b-CPU vLLM real en CPU · 7 Kubernetes en local (Helm, autoscaling con KEDA) |
+| Despliegue | Docker Compose (tres variantes) y un chart de Helm validado en minikube; CI en GitHub Actions (formato, vet, tests con `-race`, `helm lint`) |
 | Documentación | Un documento de decisiones por fase (alternativas, opción elegida, por qué) y una limitación registrada (FI-n) por cada atajo consciente |
 
 ## Los razonamientos que lo han traído hasta aquí
@@ -58,6 +59,8 @@ Las decisiones que definen el sistema, cada una con su razón y su evidencia:
 | **Dos TTFT: el del cliente y el del worker** | Sin separarlos, un TTFT alto no dice si falta capacidad (cola) o si el motor es lento (prefill). | El dashboard diagnosticó un worker colgado como "problema de cola" en una captura real. | [12](12-observabilidad.md#ejemplo-de-lectura-un-worker-colgado) |
 | **Un contrato `Worker` y un ledger compartido** | Cambiar el motor no debe tocar el control plane, y la parte delicada en concurrencia debe existir una sola vez. | Simulador y adaptador pasan la **misma batería de contrato**. Pasar a vLLM real no cambió ni el scheduler ni la API. | [13](13-fase-6a-decisiones.md) |
 | **Probar contra un falso, y después contra vLLM real** | Un falso permite probar fallos y cubrir todo el código sin coste, pero puede imitar lo que *creemos* que hace vLLM. | vLLM real confirmó los formatos y destapó seis diferencias que el falso no podía revelar. | [13](13-fase-6a-decisiones.md), [14](14-fase-6b-cpu-decisiones.md) |
+| **Autoscaling por demanda en tokens, con KEDA en lugar de un operador propio (Fase 7)** | La CPU de un worker de inferencia no dice nada de su capacidad; lo que la plataforma sabe es cuántos tokens hay reservados y en cola. KEDA convierte esa consulta de Prometheus en réplicas sin escribir CRDs ni reconciliación. | En minikube: de 1 a 4 vLLM falsos en ~40 s y vuelta a 1 en ~50 s; con carga cubrible, 95 % `200` y **0 errores en stream**, también al borrar un pod con streams en curso. | [16](16-fase-7-decisiones.md#resultados-de-la-validación) |
+| **Descubrimiento por DNS y una sola réplica con `Recreate` (Fase 7)** | Un Service *headless* da una IP por pod listo: cero dependencias y cero permisos, reutilizando el conector de la 6a. `Recreate` garantiza que nunca hay dos *ledgers* a la vez (FI-2), a cambio de un corte breve en cada despliegue. | Las bajas drenan los streams en curso; los 10 s en que el DNS va por detrás los cubre el reintento antes del primer token (8 reintentos, 0 errores). | [16](16-fase-7-decisiones.md) |
 | **Sencillez frente a perfección (6b-CPU)** | El objetivo es un sistema funcional que se pueda defender, con sus inconvenientes documentados, no uno perfecto. | De once decisiones de la 6b-CPU se aplicaron ocho; las otras tres quedaron como limitaciones conocidas. | [14 · Qué sí y qué no](14-fase-6b-cpu-decisiones.md#qué-sí-y-qué-no) |
 
 ## La evidencia: qué se midió, dónde y con qué
@@ -76,6 +79,9 @@ Las decisiones que definen el sistema, cada una con su razón y su evidencia:
 | 6b-CPU | Router frente a round-robin | **vLLM real, 2 instancias** | TTFT p50 de 24 s a 4,7 s; acierto real del 53 % al 75 %. |
 | 6b-CPU | Reserva del ledger frente a la KV-Cache real (FI-1) | **vLLM real** | El ledger reserva ~3 veces lo que se usa (29,5 % frente a 9,6 % de media). |
 | 6b-CPU | Error de la estimación de tokens (FI-3) | **vLLM real** | Prompts largos: −5 %. Prompts cortos: −28 tokens fijos (la *chat template*). |
+| 7 | Autoscaling con sobrecarga (más demanda que 4 réplicas) | minikube, vLLM falso | De 1 a 4 réplicas en ~40 s, vuelta a 1 en ~50 s; el exceso se rechaza con `503` (25 %), como diseñó la Fase 2. |
+| 7 | Carga cubrible y un pod borrado en mitad de streams | minikube, vLLM falso | 95,2 % `200`, 0,4 % `503`, **0 errores en stream**; 8 peticiones reintentadas en otro worker, todas con éxito. |
+| 7 | Puerto de administración (FI-10) | minikube | `/metrics` y `/debug/*`: `404` en el Service público, `200` en el de administración. |
 
 ## Lo que demostró vLLM real en CPU
 
@@ -112,14 +118,16 @@ Resumen; el detalle está en [14](14-fase-6b-cpu-decisiones.md).
 5. **El contrato del worker aguantó el cambio de motor.** Pasar del simulador a vLLM real no cambió el scheduler ni la API, solo añadió un adaptador.
 6. **Se ve lo que pasa.** Métricas con dos TTFT, logs por petición con un único `outcome` y un dashboard que diagnostica problemas reales.
 7. **Las pruebas con vLLM real son repetibles:** `task vllm-cpu:up`, `task vllm-cpu:smoke` y respuestas reales como *fixtures*.
+8. **Se despliega y escala en Kubernetes con un comando** (`task k8s:up`): el chart, el descubrimiento por DNS y el autoscaling por demanda en tokens están validados en minikube, y la CI comprueba tests, carreras y chart en cada cambio.
 
 ## Limitaciones conocidas
 
 | Limitación | Gravedad para producción | Estado |
 | :--- | :--- | :--- |
 | **FI-1: reserva pesimista.** El ledger reserva el peor caso y cobra el prompt entero aunque esté en caché. | **Alta:** en GPU significa pagar ~3 veces más hardware del necesario (medido en CPU). | Medida; sin corregir. |
-| **FI-2: una sola réplica del control plane.** El estado vive en memoria. | **Alta:** punto único de fallo; sin alta disponibilidad. | Abierta. |
-| **FI-10: `/metrics`, `/debug` y la administración en el puerto público.** No hay autenticación de clientes ni cuotas. | **Alta** si se expone. | Abierta. |
+| **FI-2: una sola réplica del control plane.** El estado vive en memoria. | **Alta:** punto único de fallo; sin alta disponibilidad, y un corte breve en cada despliegue (`Recreate`). | Abierta; hecha explícita en el despliegue (Fase 7). |
+| **Sin autenticación de clientes ni cuotas; el puerto de administración solo lo protege la red del clúster.** | **Alta** si se expone. | FI-10 resuelta en la Fase 7 (`-admin-addr`); autenticación y cuotas, abiertas. |
+| **Las bajas de pods abren el breaker durante la ventana del DNS** (hasta 10 s). | Baja: el reintento antes del primer token lo hace invisible (medido). | Aceptada (Fase 7). |
 | **Concurrencia limitada por memoria, no por cálculo.** | Media: grave en CPU; en GPU la memoria suele ser el límite real, pero las ráfagas de prefill también compiten. | Documentada. |
 | **El timeout de primer token no distingue un worker lento de uno colgado.** | Media: con picos de carga puede aislar workers sanos. | Documentada; hay que calibrarlo por hardware. |
 | FI-3: estimación de tokens sin tokenizer real | Baja: −5 % en prompts largos. | Medida; aceptada. |
@@ -127,18 +135,18 @@ Resumen; el detalle está en [14](14-fase-6b-cpu-decisiones.md).
 | Funciones del API rechazadas: multimodal, *tool calls*, logprobs, `n` > 1; solo `/v1/chat/completions` | Media: depende de los clientes. | Fuera de alcance, con `400` explícito. |
 | Escala del control plane sin medir (dispatcher único, lock global del scheduler) | **Desconocida.** | Nunca se ha probado por encima de decenas de peticiones por segundo. |
 
-Resueltas por el camino: FI-4 (métricas de vLLM), FI-5 (roadmap), FI-6 (diseño del árbol, validado), FI-7 (petición completa), FI-8 (tokens reales) y FI-9 (cabeceras con el primer token).
+Resueltas por el camino: FI-4 (métricas de vLLM), FI-5 (roadmap), FI-6 (diseño del árbol, validado), FI-7 (petición completa), FI-8 (tokens reales), FI-9 (cabeceras con el primer token) y FI-10 (puerto de administración separado).
 
 ## Distancia a producción con GPUs
 
-**No son retoques:** quedan cuatro bloques de trabajo de fondo y una validación imprescindible.
+**No son retoques:** quedan cuatro bloques de trabajo de fondo y una validación imprescindible. La Fase 7 redujo el bloque de despliegue, pero no los otros.
 
 | Bloque | Qué hay | Qué falta |
 | :--- | :--- | :--- |
 | **Modelo de capacidad (FI-1)** | Ledger pesimista y el dato de cuánto sobra (~3×) | Reservar con salidas esperadas o con *overbooking* usando la ocupación real y la *preemption* de vLLM como red de seguridad; descontar los prefijos en caché. Es el bloque que más coste cambia en GPU. |
 | **Alta disponibilidad (FI-2)** | Una réplica; el registro de workers con bajas que drenan | Repartir los workers entre réplicas (hash consistente) o un *sidecar* de admisión por GPU; leases que se recuperan si cae la réplica. |
-| **Seguridad y multi-cliente** | Validación de peticiones y `X-Request-Id` | Autenticación, cuotas y límites por cliente, prioridades, TLS, separar el puerto de administración (FI-10). |
-| **Despliegue y operación (Fase 7)** | Imágenes Docker, stack local, registro dinámico, conectores que esperan a que cargue el modelo | Kubernetes (descubrimiento por Endpoints, Helm), autoscaling con las métricas de la Fase 5, actualizaciones sin corte, pesos de decenas de GB, CI, Alertmanager, trazas. |
+| **Seguridad y multi-cliente** | Validación de peticiones, `X-Request-Id` y puerto de administración separado (FI-10) | Autenticación, cuotas y límites por cliente, prioridades, TLS e Ingress. |
+| **Despliegue y operación** | Chart de Helm, descubrimiento por DNS, autoscaling por demanda con KEDA, bajas que drenan, CI (Fase 7, en minikube y con vLLM falso) | Actualizaciones sin corte (depende de FI-2), escalar nodos de GPU y no solo pods, pesos de decenas de GB y arranques de minutos (el autoscaling reactivo llega tarde: hace falta capacidad de reserva o predicción), imágenes en un registro, Alertmanager, trazas, persistencia de Prometheus. |
 | **Validación en GPU y a escala** | Todo medido en simulador y en CPU | Calibrar timeouts, capacidad y umbrales con números reales; medir el control plane con miles de peticiones por segundo; repetir el benchmark del router. |
 
 **Qué se trasladaría a GPU y qué no:**
@@ -152,12 +160,14 @@ Resueltas por el camino: FI-4 (métricas de vLLM), FI-5 (roadmap), FI-6 (diseño
 
 **Modelos más grandes:** lo que hay que hacer para servirlos (repartirlos entre varias GPUs, gestionar la memoria, el *batching*) lo hace vLLM, no la plataforma. Para el control plane, un worker sigue siendo un servidor vLLM, tenga una GPU u ocho. Lo que cambia es la operación: arranques de muchos minutos, pocas réplicas caras y fallos más costosos. Ahí pesan los bloques de capacidad, alta disponibilidad y despliegue.
 
-**Veredicto:** un prototipo sólido con la arquitectura correcta y cada decisión defendible con datos. Como sistema de producción, le falta aproximadamente lo mismo que lleva hecho.
+**Sobre el autoscaling con GPUs:** el mecanismo (demanda en tokens → réplicas) se traslada; los tiempos no. Con vLLM falso un pod está listo en segundos; con GPUs, un vLLM real tarda minutos en descargar y cargar el modelo, y un nodo de GPU nuevo aún más. Escalar cuando la cola ya crece llega tarde: en producción se combina con un mínimo de réplicas de reserva, umbrales más bajos o escalado programado. Y cuando FI-1 se resuelva, la señal debería pasar a la ocupación real de la KV-Cache.
+
+**Veredicto:** un prototipo sólido con la arquitectura correcta y cada decisión defendible con datos, que ya se despliega y escala en Kubernetes. Como sistema de producción le sigue faltando mucho: el modelo de capacidad, la alta disponibilidad, la seguridad y la validación en GPU.
 
 ## Qué haría a continuación
 
 1. **Modelo de capacidad (FI-1)**, porque es lo que más coste cambia en GPU y ya hay datos para diseñarlo.
-2. **Fase 7 en local** (Kubernetes con `kind`, vLLM falso y uno real en CPU), cerrando FI-10 y decidiendo FI-2.
+2. **Alta disponibilidad (FI-2)**: repartir los workers entre réplicas o un *sidecar* de admisión por GPU. Es lo que permitiría quitar `Recreate` y desplegar sin corte.
 3. **Validación en GPU**, si algún día es posible. Sin ella, cualquier afirmación de "listo para producción" sería una suposición.
 
 ## Preguntas difíciles y cómo responderlas
@@ -173,7 +183,11 @@ Resueltas por el camino: FI-4 (métricas de vLLM), FI-5 (roadmap), FI-6 (diseño
 | *"¿Por qué estimar tokens en vez de tokenizar?"* | Tokenizar exige el tokenizer de cada modelo o una llamada al motor antes de elegir worker. La estimación erró un 5 % en prompts largos y la respuesta usa los tokens reales del motor. El caso débil (prompts cortos) está medido y aceptado. |
 | *"¿Qué pasa si se cae un worker en mitad de un stream?"* | Antes del primer token se reintenta en otro sin que el cliente lo note; después, el error va dentro del stream. El breaker aísla el worker y lo vuelve a probar después de una espera. Medido: 0 errores visibles con un worker caído antes del primer token. |
 | *"¿Cómo sabéis que el falso no os engañó?"* | Por eso existe la 6b-CPU: las respuestas reales de vLLM están en los tests y la prueba de humo corre contra vLLM real. Encontró seis diferencias, y todas están corregidas o documentadas. |
-| *"¿Qué es lo primero que cambiaríais para producción?"* | El modelo de capacidad (FI-1), y en paralelo la alta disponibilidad (FI-2) y la seguridad (FI-10). |
+| *"¿Qué es lo primero que cambiaríais para producción?"* | El modelo de capacidad (FI-1), y en paralelo la alta disponibilidad (FI-2) y la seguridad (autenticación y cuotas). |
+| *"¿Por qué KEDA y no un operador propio, como decía el roadmap?"* | Un operador (CRD, reconciliación, RBAC, `client-go`) es mucho código para lo mismo: convertir una métrica en réplicas. KEDA lo hace con un `ScaledObject` sobre nuestras propias métricas. Lo que sí es nuestro es la **señal**: la demanda en tokens que ve la plataforma, no la CPU. |
+| *"¿Por qué escaláis por tokens reservados y no por `kv_cache_usage_perc` de vLLM?"* | Porque la cola de la plataforma solo crece cuando el ledger está lleno, y el ledger reserva el peor caso (FI-1). Escalar por demanda (reservado + en cola) es coherente con lo que la plataforma admite y funciona igual con el simulador, el falso o vLLM real. Si la reserva dejara de ser pesimista, la ocupación real sería la señal correcta. |
+| *"¿Qué pasa con los streams cuando el autoscaler quita un pod?"* | El pod deja de anunciarse sano y termina sus streams antes de salir; la plataforma lo drena al verlo desaparecer del DNS. Medido: workers dados de baja con un stream en curso lo terminaron sin cortes, y las conexiones que llegaron durante la ventana del DNS se reintentaron en otro worker (0 errores). |
+| *"¿Por qué una réplica con `Recreate` en Kubernetes, si se puede tener alta disponibilidad?"* | Porque con `RollingUpdate` habría dos *ledgers* a la vez durante cada despliegue, cada uno creyéndose la única puerta de entrada (FI-2). Preferimos un corte de segundos, explícito y documentado, a sobrecomprometer la KV-Cache en silencio. |
 
 ## Cómo reproducir las pruebas
 
@@ -191,4 +205,9 @@ task vllm-cpu:up && task vllm-cpu:smoke                       # prueba de humo d
 
 VLLM_KV_BYTES=201326592 task stack:up:vllm-cpu:2              # benchmark de la 6b-CPU (ver doc 14)
 task stack:down
+
+task k8s:up                                                   # Fase 7: minikube + KEDA + chart (ver doc 16)
+task k8s:port-forward                                         # API :8080, Grafana :3000, admin :18081
+cd platform && go run ./cmd/loadgen -admin-url http://localhost:18081 -rate 1.5 -duration 180s -prefixes 8
+task k8s:status && task k8s:down
 ```

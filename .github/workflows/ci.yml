@@ -1,0 +1,30 @@
+# Continuous integration: the same checks as `task check:all`, on every push
+# and pull request. TestRealVLLM skips itself (no VLLM_URL here); the vLLM
+# smoke test and the stacks stay manual (see docs/servicio/07).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23" # the module's minimum (go.mod)
+          cache-dependency-path: platform/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: tests with the race detector
+        run: go test -race -count=2 ./...
+      - name: helm lint
+        working-directory: deploy/helm/llm-platform
+        run: helm lint . --set-file grafana.dashboard=../../observability/grafana/dashboards/llm-platform-overview.json --set-file prometheus.alerts=../../observability/prometheus/alerts.yml

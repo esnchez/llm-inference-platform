@@ -84,15 +84,29 @@ func New(sched Scheduler, cfg Config, log *slog.Logger) *Server {
 	return &Server{sched: sched, cfg: cfg, log: log, now: time.Now}
 }
 
-// Handler returns the HTTP routes.
+// Handler returns every route: the public API and the debug endpoints on
+// one port (local use, tests).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.RegisterPublic(mux)
+	s.RegisterDebug(mux)
+	return mux
+}
+
+// RegisterPublic adds the client-facing routes: the API and /healthz.
+func (s *Server) RegisterPublic(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+}
+
+// RegisterDebug adds the internal routes (/debug/workers, /debug/scheduler).
+// With -admin-addr they go on a separate port that only the cluster reaches
+// (Phase 7, FI-10).
+func (s *Server) RegisterDebug(mux *http.ServeMux) {
 	mux.HandleFunc("GET /debug/workers", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, s.sched.Snapshots())
 	})
@@ -101,7 +115,6 @@ func (s *Server) Handler() http.Handler {
 			writeJSON(w, http.StatusOK, ds.DebugStats())
 		})
 	}
-	return mux
 }
 
 // ---- OpenAI-compatible wire types ----
