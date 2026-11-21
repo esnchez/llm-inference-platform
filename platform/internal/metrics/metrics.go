@@ -37,6 +37,8 @@ var (
 	itlBuckets   = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2.5}
 	e2eBuckets   = []float64{0.25, 0.5, 1, 2.5, 5, 10, 15, 20, 30, 40, 50, 60, 120}
 	queueBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+	// Estimated / real prompt tokens: 1 is exact, 0.5 underestimates by 2x.
+	ratioBuckets = []float64{0.25, 0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 2, 4}
 )
 
 // Source is what the state collector reads: *scheduler.Scheduler.
@@ -59,6 +61,7 @@ type Metrics struct {
 	promptTok  *prometheus.CounterVec
 	genTok     *prometheus.CounterVec
 	reservedTk *prometheus.CounterVec
+	estimate   *prometheus.HistogramVec
 
 	// Scheduler events (scheduler.Observer).
 	admissions  *prometheus.CounterVec
@@ -96,6 +99,7 @@ func New() *Metrics {
 	m.promptTok = counter("prompt_tokens_total", "Prompt tokens (estimated) of admitted requests.", "model")
 	m.genTok = counter("generation_tokens_total", "Tokens generated and sent to clients.", "model")
 	m.reservedTk = counter("reserved_tokens_total", "Tokens reserved in worker ledgers by admitted requests (prompt + max_tokens).", "model")
+	m.estimate = hist("prompt_token_estimate_ratio", "Estimated / real prompt tokens, for requests whose worker reports the real count (FI-3).", ratioBuckets, "model")
 
 	m.admissions = counter("admissions_total", "Requests that got a lease, at once or after queueing.", "model", "path")
 	m.queueWait = hist("queue_wait_seconds", "Time spent in the queue by requests leaving it.", queueBuckets, "model", "outcome")
@@ -116,7 +120,7 @@ func New() *Metrics {
 	buildInfo.WithLabelValues(version, runtime.Version()).Set(1)
 
 	m.reg.MustRegister(
-		m.requests, m.inFlight, m.ttft, m.e2e, m.promptTok, m.genTok, m.reservedTk,
+		m.requests, m.inFlight, m.ttft, m.e2e, m.promptTok, m.genTok, m.reservedTk, m.estimate,
 		m.admissions, m.queueWait, m.workerTTFT, m.workerITL, m.failures, m.retries,
 		m.transitions, m.health, m.restarts, buildInfo,
 		collectors.NewGoCollector(),
@@ -191,6 +195,9 @@ func (m *Metrics) RequestFinished(r httpapi.RequestRecord) {
 	}
 	if r.CompletionTokens > 0 {
 		m.genTok.WithLabelValues(r.Model).Add(float64(r.CompletionTokens))
+	}
+	if r.UsageReported && r.PromptTokens > 0 {
+		m.estimate.WithLabelValues(r.Model).Observe(float64(r.EstimatedPromptTokens) / float64(r.PromptTokens))
 	}
 	if r.FirstToken {
 		m.ttft.WithLabelValues(r.Model).Observe(r.TTFT.Seconds())

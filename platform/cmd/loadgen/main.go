@@ -58,7 +58,7 @@ func main() {
 		sysChars  = flag.Int("system-chars", 6000, "size of each system prompt, in characters (~4 per token)")
 		skew      = flag.Float64("prefix-skew", 0, "Zipf exponent (> 1) for choosing the system prompt, so a few are hot; 0 = uniform")
 		chaos     = flag.String("chaos", "", "break one worker during the run: down, hang, errors (50% of streams fail), stall, slow or restart; empty = none")
-		chaosWkr  = flag.String("chaos-worker", "sim-worker-1", "worker that -chaos breaks")
+		chaosWkr  = flag.String("chaos-worker", "sim-worker-1", "worker that -chaos breaks: a simulated worker ID, or the URL of a fake vLLM (e.g. http://localhost:8001)")
 		chaosAt   = flag.Duration("chaos-at", 0, "when the fault starts; 0 = a third into -duration")
 		chaosFor  = flag.Duration("chaos-for", 0, "how long it lasts; 0 = a third of -duration")
 	)
@@ -145,8 +145,21 @@ func scheduleChaos(client *http.Client, url, kind, worker string, at, span time.
 		"stall":  `{"stall_after_tokens": 5}`,
 		"slow":   `{"slowdown": 4}`,
 	}
+	target := url
+	base := "/debug/workers/" + worker
+	if strings.HasPrefix(worker, "http://") || strings.HasPrefix(worker, "https://") {
+		// A fake vLLM (Phase 6a): its own fault endpoint and fault names.
+		target, base = strings.TrimRight(worker, "/"), "/fake"
+		faults = map[string]string{
+			"down":   `{"unhealthy": true, "status": 503}`,
+			"hang":   `{"hang": true}`,
+			"errors": `{"status": 500}`,
+			"stall":  `{"cut_after": 5}`,
+			"slow":   `{"slow_factor": 4}`,
+		}
+	}
 	post := func(path, body string) {
-		resp, err := client.Post(url+path, "application/json", strings.NewReader(body))
+		resp, err := client.Post(target+path, "application/json", strings.NewReader(body))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "loadgen: chaos %s: %v\n", path, err)
 			return
@@ -156,7 +169,6 @@ func scheduleChaos(client *http.Client, url, kind, worker string, at, span time.
 			fmt.Fprintf(os.Stderr, "loadgen: chaos %s: HTTP %d\n", path, resp.StatusCode)
 		}
 	}
-	base := "/debug/workers/" + worker
 	if kind == "restart" {
 		time.AfterFunc(at, func() { post(base+"/restart", "") })
 		return nil

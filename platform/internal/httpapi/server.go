@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -105,7 +106,16 @@ func (s *Server) Handler() http.Handler {
 
 // ---- OpenAI-compatible wire types ----
 
+// chatMessage is a request message; its UnmarshalJSON (params.go) only
+// accepts string content.
 type chatMessage struct {
+	Role    string
+	Content string
+	Name    string
+}
+
+// responseMessage is the assistant message of a non-streaming response.
+type responseMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
@@ -121,6 +131,10 @@ type chatRequest struct {
 	MaxCompletionTokens *int           `json:"max_completion_tokens"`
 	Stream              bool           `json:"stream"`
 	StreamOptions       *streamOptions `json:"stream_options"`
+
+	// raw is the whole request body, field by field: the parameters that
+	// are not controlled here are forwarded to the engine (params.go).
+	raw map[string]json.RawMessage
 }
 
 type usage struct {
@@ -150,9 +164,9 @@ type completionChunk struct {
 }
 
 type messageChoice struct {
-	Index        int         `json:"index"`
-	Message      chatMessage `json:"message"`
-	FinishReason *string     `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Message      responseMessage `json:"message"`
+	FinishReason *string         `json:"finish_reason"`
 }
 
 type completion struct {
@@ -196,9 +210,15 @@ func (s *Server) handleChatCompletions(rw http.ResponseWriter, r *http.Request) 
 	rec := RequestRecord{Model: UnknownModel}
 	log := s.log.With("request_id", requestID)
 
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 	var body chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes))
+	if err == nil {
+		err = json.Unmarshal(raw, &body)
+	}
+	if err == nil {
+		err = json.Unmarshal(raw, &body.raw)
+	}
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "", "invalid JSON body: "+err.Error())
 		s.finish(log, w, start, rec, OutcomeRejectedInvalid, nil, streamResult{err: err})
 		return
@@ -259,6 +279,12 @@ func (s *Server) finish(log *slog.Logger, w *statusWriter, start time.Time, rec 
 	rec.Outcome = outcome
 	rec.Duration = s.now().Sub(start)
 	rec.CompletionTokens = res.completionTokens
+	if res.usage != nil {
+		rec.UsageReported = true
+		rec.EstimatedPromptTokens = rec.PromptTokens
+		rec.PromptTokens = res.usage.PromptTokens
+		rec.CompletionTokens = res.usage.CompletionTokens
+	}
 	if !res.firstToken.IsZero() {
 		rec.FirstToken = true
 		rec.TTFT = res.firstToken.Sub(start)
@@ -309,9 +335,20 @@ func (s *Server) modelLabel(model string) string {
 }
 
 type streamResult struct {
-	completionTokens int
+	completionTokens int // chunks received (tokens when the worker gives no usage)
+	usage            *inference.Usage
 	firstToken       time.Time
 	err              error
+}
+
+// tokenCounts returns the prompt and completion tokens of a finished
+// stream: the engine's own count when it sent one (FI-8), else the estimate
+// and the number of chunks.
+func (r streamResult) tokenCounts(req inference.InferenceRequest) (prompt, completion int) {
+	if r.usage != nil {
+		return r.usage.PromptTokens, r.usage.CompletionTokens
+	}
+	return req.PromptTokens, r.completionTokens
 }
 
 func (s *Server) stream(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter,
@@ -358,6 +395,9 @@ func (s *Server) stream(ctx context.Context, cancel context.CancelFunc, w http.R
 			res.firstToken = s.now()
 		}
 		res.completionTokens++
+		if c.Usage != nil {
+			res.usage = c.Usage
+		}
 		d := delta{Content: c.Text}
 		if c.Index == 0 {
 			d.Role = "assistant"
@@ -384,7 +424,7 @@ func (s *Server) stream(ctx context.Context, cancel context.CancelFunc, w http.R
 		// in-band, as OpenAI-compatible servers do.
 		send(map[string]apiError{"error": {Message: res.err.Error(), Type: "server_error"}})
 	case res.err == nil && includeUsage:
-		u := usageOf(req, res.completionTokens)
+		u := usageOf(res.tokenCounts(req))
 		send(completionChunk{
 			ID: req.ID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 			Choices: []chunkChoice{}, Usage: &u,
@@ -409,6 +449,9 @@ func (s *Server) collect(ctx context.Context, w http.ResponseWriter,
 			res.firstToken = s.now()
 		}
 		res.completionTokens++
+		if c.Usage != nil {
+			res.usage = c.Usage
+		}
 		text.WriteString(c.Text)
 		if c.FinishReason != inference.FinishNone {
 			finish = c.FinishReason
@@ -424,10 +467,10 @@ func (s *Server) collect(ctx context.Context, w http.ResponseWriter,
 		ID: req.ID, Object: "chat.completion", Created: s.now().Unix(), Model: req.Model,
 		Choices: []messageChoice{{
 			Index:        0,
-			Message:      chatMessage{Role: "assistant", Content: text.String()},
+			Message:      responseMessage{Role: "assistant", Content: text.String()},
 			FinishReason: finishReason(finish),
 		}},
-		Usage: usageOf(req, res.completionTokens),
+		Usage: usageOf(res.tokenCounts(req)),
 	})
 	return res
 }
@@ -449,6 +492,17 @@ func (s *Server) toInferenceRequest(body chatRequest) (inference.InferenceReques
 	if maxTokens < 1 || maxTokens > s.cfg.MaxTokensLimit {
 		return inference.InferenceRequest{}, fmt.Errorf("max_tokens must be between 1 and %d", s.cfg.MaxTokensLimit)
 	}
+	params, err := forwardedParams(body.raw)
+	if err != nil {
+		return inference.InferenceRequest{}, err
+	}
+	messages := make([]inference.Message, len(body.Messages))
+	for i, m := range body.Messages {
+		if m.Role == "" {
+			return inference.InferenceRequest{}, fmt.Errorf("messages[%d]: role is required", i)
+		}
+		messages[i] = inference.Message{Role: m.Role, Content: m.Content, Name: m.Name}
+	}
 	prompt := renderPrompt(body.Messages)
 	return inference.InferenceRequest{
 		ID:           newRequestID(),
@@ -459,6 +513,8 @@ func (s *Server) toInferenceRequest(body chatRequest) (inference.InferenceReques
 		// Hashed once here; the scheduler may try to place the request
 		// many times while it waits in the queue.
 		PrefixHashes: prefix.Hashes(body.Model, prompt),
+		Messages:     messages,
+		Params:       params,
 	}, nil
 }
 
@@ -557,11 +613,11 @@ func finishReason(f inference.FinishReason) *string {
 	return &s
 }
 
-func usageOf(req inference.InferenceRequest, completionTokens int) usage {
+func usageOf(prompt, completion int) usage {
 	return usage{
-		PromptTokens:     req.PromptTokens,
-		CompletionTokens: completionTokens,
-		TotalTokens:      req.PromptTokens + completionTokens,
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      prompt + completion,
 	}
 }
 

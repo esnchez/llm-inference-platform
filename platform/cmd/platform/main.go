@@ -20,6 +20,7 @@ import (
 	"llm-inference-platform/internal/prefix"
 	"llm-inference-platform/internal/scheduler"
 	"llm-inference-platform/internal/simworker"
+	"llm-inference-platform/internal/vllm"
 )
 
 func main() {
@@ -57,6 +58,9 @@ func run() error {
 		stallTimeout  = flag.Duration("stall-timeout", 10*time.Second, "a stream with no new token for this long is a hung worker")
 		maxRetries    = flag.Int("max-retries", 1, "retries on another worker when one fails before the first token; -1 = none")
 		shutdownGrace = flag.Duration("shutdown-grace", 15*time.Second, "time given to in-flight streams on shutdown")
+		vllmURLs      = flag.String("vllm", "", "comma-separated vLLM server URLs (e.g. http://gpu-1:8000); each is registered once it is ready. Combine with -workers 0 for vLLM only")
+		vllmKey       = flag.String("vllm-api-key", os.Getenv("VLLM_API_KEY"), "API key sent to vLLM as a Bearer token (default $VLLM_API_KEY)")
+		vllmBudget    = flag.Int("vllm-token-budget", 0, "token budget of each vLLM worker; 0 = discover it from vllm:cache_config_info")
 	)
 	flag.Parse()
 
@@ -143,9 +147,23 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Phase 6a: one connector per vLLM server; it registers the worker in
+	// the scheduler when the server is ready (it may be loading the model).
+	for _, u := range strings.Split(*vllmURLs, ",") {
+		if u = strings.TrimSpace(u); u == "" {
+			continue
+		}
+		c := &vllm.Connector{
+			Config:   vllm.Config{BaseURL: u, APIKey: *vllmKey, TokenBudget: *vllmBudget, LeaseTTL: *leaseTTL},
+			Registry: sched,
+			Log:      log.With("component", "vllm-connector"),
+		}
+		go c.Run(ctx)
+	}
+
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("platform listening", "addr", *addr, "workers", *numWorkers, "models", modelList,
+		log.Info("platform listening", "addr", *addr, "workers", *numWorkers, "vllm", *vllmURLs, "models", modelList,
 			"token_budget", *budget, "placement", *placement, "prefix_cache_blocks", cacheBlocks)
 		errc <- srv.ListenAndServe()
 	}()

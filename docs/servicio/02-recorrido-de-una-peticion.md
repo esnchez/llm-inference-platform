@@ -54,6 +54,7 @@ sequenceDiagram
 - `toInferenceRequest` valida:
   - `model` no vacío y `messages` con al menos un mensaje.
   - `max_tokens`: se toma `max_completion_tokens` si viene, si no `max_tokens`, si no `DefaultMaxTokens` (256). Debe estar entre 1 y `MaxTokensLimit` (4096). Fuera de rango → `400`.
+  - Desde la Fase 6a: cada mensaje con `role` y con `content` de texto (un `content` en partes o nulo → `400` con mensaje claro), y los parámetros que la plataforma no sabría atender (`n` > 1, `best_of`, `logprobs`, `top_logprobs`, `tools`, `tool_choice`, `functions`…) → `400` con la lista. El resto de campos se reenvía al motor tal cual (`internal/httpapi/params.go`).
 
 ### 2. Construcción del `InferenceRequest`
 
@@ -64,6 +65,8 @@ sequenceDiagram
 | `Prompt` | `renderPrompt`: cada mensaje como `role: content\n`. |
 | `PromptTokens` | `tokens.Estimate(Prompt)` (~4 caracteres/token, FI-3). |
 | `MaxNewTokens` | El `max_tokens` resuelto en el paso 1. |
+| `Messages` | Los mensajes del cliente tal cual (Fase 6a): el adaptador de vLLM se los envía al motor, que aplica la *chat template* del modelo. |
+| `Params` | Los campos que la plataforma no controla (`temperature`, `top_p`, `stop`, `seed`, `response_format`, extras de vLLM…), sin interpretar. |
 | `PrefixHashes` | `prefix.Hashes(model, Prompt)`: un hash encadenado por cada bloque completo de 64 caracteres (16 tokens estimados). `nil` si el prompt es más corto. Se calcula aquí, una vez, porque la colocación puede intentarse muchas veces mientras la petición espera en la cola ([09 · Decisión 2](09-fase-3-routing-por-prefijos.md#decisión-2-dónde-se-calculan-los-hashes)). |
 
 `renderPrompt` **no** es una *chat template* real: solo sirve para estimar el coste. Ver [06 · Relación con vLLM](06-relacion-con-vllm.md) para lo que implica.

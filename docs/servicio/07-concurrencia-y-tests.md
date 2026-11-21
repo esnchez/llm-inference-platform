@@ -58,8 +58,14 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | :--- | :--- |
 | `task check` | En cada cambio: `gofmt` + `go vet` + tests. |
 | `task check:all` | Antes de cerrar una fase: `check` + tests con `-race` en Docker. |
-| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %; al cerrar la Fase 5: `metrics` 97 %, `scheduler` 94 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 92 %). |
+| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %; al cerrar la Fase 5: `metrics` 97 %, `scheduler` 94 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 92 %; al cerrar la Fase 6a: `httpapi` 93 %, `metrics` 94 %, `scheduler` 94 %, `simworker` 94 %, `vllm` 88 %, y `ledger` 98 % / `fakevllm` 83 % medidos con `-coverpkg`, porque los ejercitan los tests de otros paquetes). |
 | `task loadgen` | Generador de carga contra un servidor en marcha (no es un test: sirve para comparar configuraciones). |
+
+### Batería de contrato común (`internal/workertest`, Fase 6a)
+
+`workertest.Run` se ejecuta contra **cada implementación de `Worker`**: el simulador (`simworker/contract_test.go`) y el adaptador de vLLM contra un vLLM falso por HTTP (`vllm/integration_test.go`). Subtests: admisión (reserva, encaje exacto, `ErrAtCapacity`, `ErrRequestTooLarge`, `ErrModelNotServed`, `ErrInvalidRequest`, contexto cancelado, `Release` idempotente), stream completo que libera capacidad, lease de un solo uso, cancelación que libera al instante, TTL sin doble liberación, señal `CapacityChanged` y 60 adquisiciones concurrentes sin superar el presupuesto. `workertest.Stub` da un worker mínimo sobre el ledger para tests que necesitan `usage` o `max_model_len`.
+
+`internal/ledger`: validación de la configuración y `MaxRequestTokens` (una petición que cabe en el presupuesto pero no en `max_model_len`).
 
 ### `internal/simworker` — contrato del lease
 
@@ -197,7 +203,29 @@ Montan las piezas reales como `cmd/platform` (workers simulados, scheduler y API
 | `TestQueueMetrics` | Una petición que espera da una admisión `queued` y una observación de espera en cola. |
 | `TestEventCountersStartAtZero` | Los contadores de eventos existen a 0 desde el primer *scrape*, para que `increase()` vea el primer evento. |
 
+### `internal/vllm` — el adaptador (Fase 6a)
+
+| Test | Qué garantiza |
+| :--- | :--- |
+| `TestContract` | La batería común, contra el adaptador y un vLLM falso por HTTP. |
+| `TestParseMetrics` | El parser del formato de texto de Prometheus: etiquetas con comillas escapadas, sumas por etiqueta, marcas de tiempo, líneas inválidas. |
+| `TestErrorTranslation` | La tabla de errores: `400` de longitud (formato nuevo y antiguo de vLLM) → `ErrRequestTooLarge`; otro `400`/`422` → `ErrInvalidRequest`; `5xx`, `404`, `401` → `ErrWorkerFailure`; un error de la petición nunca es fallo del worker. |
+| `TestRequestBodyControlledFieldsWin` | Un parámetro reenviado no puede pisar `max_tokens`, `stream` ni `stream_options`. |
+| `TestRelay` | El SSE de vLLM: *keep-alive*, delta inicial sin contenido, `usage` en un chunk sin `choices`, `[DONE]`; stream sin `[DONE]`, evento de error (nuevo y antiguo) y evento ilegible → `ErrWorkerFailure`; salida vacía. |
+| `TestDiscover` | Presupuesto = bloques × tamaño de bloque, `max_model_len`, ID; servidor cargando o inalcanzable → error. |
+| `TestForwardedRequestAndUsage` | vLLM recibe los parámetros, `max_tokens`, `stream_options.include_usage` y la API key; el último chunk trae el `usage`. |
+| `TestErrorsReachTheContract` | Contra el falso: longitud excesiva según su tokenizer, `500`, stream cortado, evento de error. |
+| `TestCancellationAbortsTheEngineRequest` | Cancelar cierra la conexión y **el motor ve el aborto** (sin esto seguiría generando y ocupando VRAM). |
+| `TestHealthEngineStatsAndRestarts` | Ocupación, caché de prefijos y reinicios, con y sin `process_start_time_seconds`; `/health` fallando → no sano. |
+| `TestConnectorWaitsForTheModelThenRegisters` | El conector no registra mientras el modelo carga, registra después, y no vuelve a registrar un servidor que no cambió. |
+| `TestEndToEnd` | API + scheduler + adaptador + dos vLLM falsos, uno roto: todas las respuestas `200`, `usage` del motor (no la estimación), reintentos con éxito. |
+| `TestStressWithChaos` | 400 peticiones concurrentes contra 3 vLLM falsos que fallan, se cuelgan, cortan, emiten errores, se reinician y dejan de estar sanos: ningún ledger sobre su presupuesto, un resultado por petición, nada reservado ni en curso al final. |
+
+En `internal/httpapi` (Fase 6a): `TestParamsAreForwarded`, `TestUnsupportedParamsAreRejected`, `TestMessageContentMustBeAString`, `TestEngineUsageIsReported` (el `usage` del motor en la respuesta con y sin streaming, y en el registro de métricas) y `TestMaxModelLenRejectsAtOnce` (`400` inmediato, sin cola).
+
 ### Huecos conocidos
+
+- **El vLLM falso imita lo que creemos que hace vLLM.** Formatos y nombres de métricas están sin contrastar con una versión concreta: es lo primero de la 6b ([13](13-fase-6a-decisiones.md#lo-que-el-falso-no-puede-decir-pendiente-de-la-6b)).
 
 - El stack de observabilidad (Dockerfile, compose, dashboard) no tiene tests automáticos. Se validó al cerrar la Fase 5: `promtool check config`/`check rules`, cada consulta del dashboard contra Prometheus tras una prueba con `loadgen`, y revisión visual de una captura.
 

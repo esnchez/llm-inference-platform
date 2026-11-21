@@ -1,6 +1,6 @@
 # Distributed LLM Inference Platform
 
-> **Estado:** Fases 1 a 4 implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md), [Fase 5](docs/servicio/11-fase-5-decisiones.md). **Observabilidad:** [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md).  
+> **Estado:** Fases 1 a 5 y 6a implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados; adaptador vLLM probado contra un vLLM falso). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md), [Fase 5](docs/servicio/11-fase-5-decisiones.md), [Fase 6a](docs/servicio/13-fase-6a-decisiones.md). **Observabilidad:** [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md).  
 > **Documentación de la implementación:** [`docs/servicio/`](docs/servicio/README.md) (componentes, recorrido de una petición, leases, relación con vLLM).  
 > **Objetivo:** Construir una plataforma de serving de LLM distribuida a nivel de producción, con routing consciente de KV-Cache (Prefix-aware), scheduling basado en capacidad de tokens (VRAM), control de concurrencia atómico mediante *leases*, y autoscaling predictivo para K8s/vLLM.
 
@@ -196,9 +196,18 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 ### Fase 6 — Adaptador vLLM y GPUs Físicas
 > Revisar antes de empezar: [FI-1](#fi-1-reserva-pesimista-de-capacidad), [FI-3](#fi-3-estimación-de-tokens-sin-tokenizer), [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm), [FI-7](#fi-7-el-contrato-solo-transporta-el-prompt-aplanado), [FI-8](#fi-8-un-tokenchunk-no-siempre-es-un-token), [FI-9](#fi-9-las-cabeceras-200-se-envían-antes-de-que-el-worker-responda).
 
-- [ ] Empaquetado en Docker de los componentes de Go. *(Adelantado en la Fase 5: `platform/Dockerfile` del control plane con workers simulados.)*
-- [ ] Implementar `VLLMAdapter` que traduce el contrato `Lease` a llamadas reales de la API de vLLM.
+> Partida en dos: **6a**, código probado contra un vLLM falso, sin coste; **6b**, GPUs y benchmark. Decisiones, implementación y lo que queda para la 6b: [`docs/servicio/13-fase-6a-decisiones.md`](docs/servicio/13-fase-6a-decisiones.md).
+
+**6a — Adaptador sin GPU**
+- [x] Contrato con la petición completa (mensajes y parámetros, FI-7) y tokens reales de vLLM (FI-8).
+- [x] Ledger compartido entre `simworker` y el adaptador (`internal/ledger`), con batería de contrato común.
+- [x] Implementar `VLLMAdapter` que traduce el contrato `Lease` a llamadas reales de la API de vLLM (descubrimiento, errores, salud y métricas del motor).
+- [x] vLLM falso (`fakevllm`) para tests y para el stack (`task stack:up:fake-vllm`).
+- [x] Empaquetado en Docker de los componentes de Go (`platform/Dockerfile`, una imagen por comando).
+
+**6b — GPUs y benchmark**
 - [ ] Provisionar clúster efímero de GPUs (AWS/RunPod) con modelos ligeros (Llama-3-8B).
+- [ ] Fijar la versión de vLLM (FI-4), calibrar timeouts y revisar FI-1 y FI-3 con datos reales.
 - [ ] Benchmarking (llmperf) comparando el Router Inteligente vs Balanceo clásico.
 
 ### Fase 7 — Kubernetes Operator (Autoscaling)
@@ -227,7 +236,11 @@ task loadgen -- -rate 4 -duration 45s -chaos down   # tumba sim-worker-1 a mitad
 
 # Observabilidad (necesita Docker): plataforma + Prometheus (:9090) + Grafana (:3000) con el dashboard
 task stack:up
+task stack:up:fake-vllm             # variante: la plataforma habla por HTTP con 3 vLLM falsos (Fase 6a)
 task stack:down
+
+# Contra servidores vLLM (Fase 6a/6b): se registran solos cuando han cargado el modelo
+task run -- -workers 0 -vllm http://gpu-1:8000,http://gpu-2:8000
 ```
 
 **Suite de tests** (definida en `Taskfile.yml`; `task --list` muestra todas las tareas):
@@ -273,7 +286,8 @@ deploy/observability/           # docker-compose con Prometheus y Grafana, alert
 platform/                       # módulo Go llm-inference-platform
 ├── go.mod
 ├── cmd/platform/               # binario: flags, wiring, graceful shutdown, /debug de administración de workers
-├── cmd/loadgen/                # generador de carga (Poisson, chat + RAG, cancelaciones, system prompts compartidos)
+├── cmd/loadgen/                # generador de carga (Poisson, chat + RAG, cancelaciones, system prompts compartidos, caos)
+├── cmd/fakevllm/               # vLLM falso como binario (Fase 6a)
 └── internal/
     ├── inference/              # contrato core: Worker, Lease, InferenceRequest, TokenChunk, errores
     ├── simworker/              # SimulatedWorker: presupuesto de tokens, TTFT/ITL simulados, TTL de leases, caché de prefijos, fallos inyectables
@@ -281,6 +295,9 @@ platform/                       # módulo Go llm-inference-platform
     ├── prefix/                 # hashes de prefijo por bloque y Radix Tree de prefijos por worker
     ├── httpapi/                # API OpenAI-compatible con SSE
     ├── metrics/                # métricas Prometheus (Fase 5)
+    ├── ledger/                 # contabilidad de capacidad compartida por todos los workers (Fase 6a)
+    ├── vllm/                   # VLLMAdapter y vLLM falso (Fase 6a)
+    ├── workertest/             # batería de contrato común a los workers (tests)
     └── tokens/                 # estimación de tokens (~4 caracteres/token) sin tokenizer
 ```
 
@@ -314,6 +331,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Problema:** el error puede ser de ~2× en código o en idiomas distintos del inglés (incluido el español), lo que distorsiona directamente la admisión (FI-1) y los límites de contexto.
 - **Opciones:** tokenizer por modelo en Go (cgo con HF *tokenizers* o una implementación BPE nativa); el endpoint `/tokenize` de vLLM (un *round-trip* extra antes de admitir); mantener la estimación con un margen de seguridad configurable por modelo; corregir a posteriori con el `usage` real que devuelve el motor.
 - **Revisar:** en la Fase 6, cuando el tokenizer real esté disponible.
+- **Avance (2026-11-20, Fase 6a):** con un motor real, la métrica `llmplatform_prompt_token_estimate_ratio` mide el error de la estimación contra su tokenizer, y la respuesta al cliente ya lleva los tokens reales. La decisión (tokenizer o margen) se toma en la 6b con datos de vLLM.
 
 ### FI-4. Nombre de la métrica de KV-Cache de vLLM
 - **Problema:** `vllm:gpu_cache_usage_factor`, citada en las secciones 2, 4.2 y la Fase 7, no existe. vLLM expone `vllm:gpu_cache_usage_perc` (motor V0) y `vllm:kv_cache_usage_perc` (motor V1), ambas como fracción 0–1.
@@ -337,12 +355,14 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Problema:** vLLM necesita los `messages` originales para aplicar la *chat template* de cada modelo, y los parámetros de muestreo para generar lo que el cliente pidió. Con el contrato actual el `VLLMAdapter` no tiene esa información.
 - **Opciones:** ampliar `InferenceRequest` con los mensajes estructurados y un bloque de parámetros de muestreo tipado; o transportar el cuerpo original de la petición (`json.RawMessage`) para reenviarlo a vLLM sin reinterpretarlo, manteniendo los campos que necesita el control plane (modelo, coste) aparte.
 - **Revisar:** al empezar el `VLLMAdapter` (Fase 6).
+- **Resuelto (2026-11-20, Fase 6a):** `InferenceRequest.Messages` y `Params`; la API controla `model`, `messages`, `max_tokens`, `stream` y `stream_options`, rechaza con `400` lo que no sabría atender (`n` > 1, logprobs, *tool calls*, `content` en partes) y reenvía el resto. Ver [`13`](docs/servicio/13-fase-6a-decisiones.md#decisión-1-la-petición-en-el-contrato-fi-7).
 
 ### FI-8. Un `TokenChunk` no siempre es un token
 - **Decisión actual:** cada `TokenChunk` se trata como un token: `completion_tokens` se calcula contando chunks e `Index` es la posición del token.
 - **Problema:** vLLM normalmente emite un token por evento, pero puede agrupar varios (al retener bytes de un carácter UTF-8 incompleto o con *speculative decoding*). El `usage` devuelto al cliente y las métricas de tokens (ITL, throughput) serían incorrectos.
 - **Opciones:** tomar `completion_tokens` (y `prompt_tokens`) del `usage` que devuelve vLLM (`stream_options.include_usage`) y transportarlo en el último chunk; renombrar `Index` como índice de chunk y no de token.
 - **Revisar:** al empezar el `VLLMAdapter` (Fase 6).
+- **Resuelto (2026-11-20, Fase 6a):** `TokenChunk.Usage` en el último chunk; la API y las métricas usan esas cifras cuando existen. `Index` es índice de chunk. Ver [`13`](docs/servicio/13-fase-6a-decisiones.md#decisión-2-tokens-reales-fi-8-y-fi-3).
 
 ### FI-9. Las cabeceras `200` se envían antes de que el worker responda
 - **Decisión actual:** tras obtener el lease, el handler escribe `200` y las cabeceras SSE antes de que `ExecuteStream` produzca el primer chunk.

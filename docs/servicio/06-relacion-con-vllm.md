@@ -46,9 +46,9 @@ En una frase: **vLLM optimiza una GPU; la plataforma optimiza el clúster de GPU
 3. **La ITL depende del batch.** Con más peticiones simultáneas, cada paso de decode sirve a más secuencias: sube el throughput total pero cada petición va más lenta. El simulador usa una ITL fija (ver [04](04-worker-simulado.md)).
 4. **Los tokens reales salen del tokenizer del modelo**, no de "4 caracteres por token" (**FI-3**).
 
-## Cómo encajará el `VLLMAdapter` (Fase 6)
+## El `VLLMAdapter` (Fase 6a)
 
-Implementará `inference.Worker` y `inference.Lease` contra un servidor vLLM:
+**Implementado en la Fase 6a** (`internal/vllm`, decisiones en [13](13-fase-6a-decisiones.md)) y probado contra un vLLM falso; falta contrastarlo con un vLLM real (6b). Implementa `inference.Worker` sobre el ledger compartido:
 
 ```mermaid
 sequenceDiagram
@@ -73,16 +73,16 @@ sequenceDiagram
     A->>A: libera la reserva local
 ```
 
-| Método | Implementación prevista |
+| Método | Implementación |
 | :--- | :--- |
-| `AcquireLease` | Contabilidad local, igual que hoy en `simworker`: vLLM no ofrece una API para reservar. La atomicidad depende de que esta réplica sea la única puerta de entrada a ese vLLM (**FI-2**). El presupuesto se configura a partir de la capacidad de KV-Cache que vLLM informa al arrancar. |
-| `ExecuteStream` | Petición HTTP en streaming a vLLM con `http.NewRequestWithContext(ctx, …)`: cancelar `ctx` cierra la conexión y vLLM aborta la generación. Cada evento SSE de vLLM se traduce a `TokenChunk`. |
-| `Release` | Libera la reserva local (idempotente, como hoy). |
-| `CapacityChanged` | Igual que en `simworker`: un envío no bloqueante en un canal con buffer 1 cada vez que se libera la reserva local (al cerrarse el stream de vLLM, en `Release` o por TTL). |
-| `Snapshot` | Contabilidad local + métricas leídas de `/metrics` de vLLM (ocupación de KV-Cache, peticiones en ejecución y en espera). |
-| Salud | `GET /health` de vLLM, para los heartbeats de la Fase 4. |
+| Descubrimiento (`Connector`) | Antes de registrarse: `GET /v1/models` (modelos y `max_model_len`) y `GET /metrics` (`vllm:cache_config_info` → presupuesto = `num_gpu_blocks × block_size`). Reintenta con *backoff* mientras vLLM carga el modelo y redescubre cada 30 s. |
+| `AcquireLease` | El ledger compartido (`internal/ledger`): vLLM no ofrece una API para reservar. La atomicidad depende de que esta réplica sea la única puerta de entrada a ese vLLM (**FI-2**). Límite por petición = `max_model_len`. |
+| `ExecuteStream` | `POST /v1/chat/completions` con los `messages`, los parámetros reenviados y los campos controlados (`max_tokens`, `stream`, `stream_options.include_usage`), ligado a `ctx`: cancelar cierra la conexión y vLLM aborta. El SSE se traduce a `TokenChunk`; el último lleva `finish_reason` y el `usage` del motor. |
+| Errores | Red y `5xx`/`404`/`401` → `ErrWorkerFailure`; `400` de longitud → `ErrRequestTooLarge`; otro `400` → `ErrInvalidRequest` ([13 · Decisión 6](13-fase-6a-decisiones.md#decisión-6-traducción-de-errores)). |
+| `Health` | `GET /health` y, en la misma consulta, `GET /metrics`: reinicios (`process_start_time_seconds`, o un contador que baja), acierto real de la caché de prefijos y ocupación real de la KV-Cache (`WorkerSnapshot.Engine`). |
+| `Release`, `CapacityChanged` | Los del ledger, idénticos a los del simulador. |
 
-Gracias a que el control plane ya trabaja con interfaces, `httpapi` y `scheduler` no cambian: `main` solo crea adaptadores en lugar de `simworker`.
+`httpapi` y `scheduler` no cambiaron para hablar con vLLM: `main` crea un `Connector` por cada URL de `-vllm`. Simulados y vLLM pueden convivir en el mismo pool.
 
 ### Dónde corre el adaptador y qué cruza la red
 
@@ -98,14 +98,14 @@ El adaptador sabe que una petición terminó **porque se cierra el stream SSE qu
 
 Si en el futuro hiciera falta información que vive en vLLM (la ocupación real para relajar FI-1, o qué prefijos tiene cada GPU para la Fase 3), la regla es **leer estado agregado periódicamente** (`/metrics` cada 100 ms – 1 s) o consumir eventos agrupados fuera del camino crítico, nunca un evento por bloque. Las versiones recientes de vLLM pueden publicar eventos de KV-Cache agrupados; hay que comprobarlo contra la versión que se fije (como en **FI-4**). Ver [08 · Decisión 2](08-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre).
 
-## Huecos del contrato actual que el adaptador tendrá que cerrar
+## Huecos del contrato que el adaptador tenía que cerrar
 
-Son consecuencias del contrato de la Fase 1 que conviene resolver antes de, o durante, la Fase 6:
+Eran consecuencias del contrato de la Fase 1. **Los cuatro primeros están cerrados** (FI-7 y FI-8 en la Fase 6a, FI-9 en la Fase 4 y 6a); el texto original se conserva como registro.
 
-1. **`InferenceRequest` solo lleva el prompt aplanado.** `renderPrompt` convierte los mensajes en `role: content\n` únicamente para estimar el coste. vLLM necesita los `messages` originales para aplicar la *chat template* del modelo, y también los parámetros de muestreo que hoy se ignoran (`temperature`, `top_p`, `stop`, …). El contrato tendrá que transportar los mensajes y esos parámetros, o el cuerpo original de la petición (**FI-7**).
-2. **Un `TokenChunk` no siempre es exactamente un token.** vLLM normalmente emite un token por evento, pero puede agrupar varios (por ejemplo, al retener bytes de un carácter UTF-8 incompleto, o con *speculative decoding*). Hoy `completion_tokens` se calcula contando chunks; con vLLM debería tomarse del `usage` que devuelve el propio motor (**FI-8**).
+1. ~~**`InferenceRequest` solo lleva el prompt aplanado.**~~ **Resuelto en la 6a:** `Messages` y `Params` (con campos controlados y rechazados). `renderPrompt` convierte los mensajes en `role: content\n` únicamente para estimar el coste. vLLM necesita los `messages` originales para aplicar la *chat template* del modelo, y también los parámetros de muestreo que hoy se ignoran (`temperature`, `top_p`, `stop`, …). El contrato tendrá que transportar los mensajes y esos parámetros, o el cuerpo original de la petición (**FI-7**).
+2. ~~**Un `TokenChunk` no siempre es exactamente un token.**~~ **Resuelto en la 6a:** `TokenChunk.Usage` con los tokens del motor; `Index` es índice de chunk. vLLM normalmente emite un token por evento, pero puede agrupar varios (por ejemplo, al retener bytes de un carácter UTF-8 incompleto, o con *speculative decoding*). Hoy `completion_tokens` se calcula contando chunks; con vLLM debería tomarse del `usage` que devuelve el propio motor (**FI-8**).
 3. ~~**Las cabeceras `200` se envían antes de que el worker responda.**~~ **Resuelto en la Fase 4:** el handler espera al primer chunk para enviar el `200`, así que un rechazo de vLLM al empezar llega al cliente con su código (**FI-9**). Para que sea un `400` y no un `503`, el adaptador debe traducir el `400` de vLLM a `ErrRequestTooLarge` o `ErrInvalidRequest`, nunca a `ErrWorkerFailure`.
-4. **`PrefixHashes` no le sirve a vLLM.** El adaptador no lo enviará: vLLM calcula sus propios hashes sobre los tokens reales. El router seguirá usándolos para su árbol. Hay que comprobar que la *chat template* del modelo no inserta texto variable al principio del prompt (fechas, IDs), porque rompería en vLLM prefijos que el router cree compartidos ([09 · Limitaciones](09-fase-3-routing-por-prefijos.md#limitaciones-y-trabajo-futuro)).
+4. **`PrefixHashes` no le sirve a vLLM.** El adaptador no lo envía: vLLM calcula sus propios hashes sobre los tokens reales. El router seguirá usándolos para su árbol. Hay que comprobar que la *chat template* del modelo no inserta texto variable al principio del prompt (fechas, IDs), porque rompería en vLLM prefijos que el router cree compartidos ([09 · Limitaciones](09-fase-3-routing-por-prefijos.md#limitaciones-y-trabajo-futuro)).
 5. **El `finish_reason` real** puede ser `stop` (fin natural, *stop sequence*) además de `length`; el tipo `FinishReason` ya lo contempla.
 
 ## Por qué el diseño actual sigue siendo válido con vLLM

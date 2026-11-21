@@ -41,6 +41,8 @@ El orden importa. El dashboard está ordenado igual: se mira de arriba abajo y c
 task stack:up                     # construye la imagen y arranca plataforma + Prometheus + Grafana (necesita Docker)
 task loadgen -- -rate 4 -duration 2m -prefixes 24 -rag-fraction 0      # tráfico con prefijos compartidos
 task loadgen -- -rate 5 -duration 100s -prefixes 24 -chaos hang        # o con un worker que se cuelga a mitad
+task stack:up:fake-vllm           # variante (Fase 6a): la plataforma habla por HTTP con 3 vLLM falsos (:8001-8003)
+task loadgen -- -rate 5 -duration 90s -prefixes 24 -chaos hang -chaos-worker http://localhost:8001   # caos sobre un vLLM falso
 task stack:logs                   # logs JSON de la plataforma
 task stack:down                   # para y borra el stack (no guarda datos)
 ```
@@ -211,6 +213,19 @@ Los rechazos no tienen métrica propia: son `llmplatform_requests_total{outcome=
 | `llmplatform_worker_degraded` | G·S | `worker` | 1 si su ITL supera 2× la mediana de los demás | Si está a 1, solo recibe tráfico cuando los demás están llenos. |
 | `llmplatform_worker_draining` | G·S | `worker` | 1 mientras se drena tras una baja | Explica por qué un worker deja de recibir peticiones. |
 | `llmplatform_worker_itl_ewma_seconds` | G·S | `worker` | La ITL media que usa el scheduler para decidir "degradado" | Permite ver el criterio exacto de la decisión, no una aproximación. |
+
+### 5b. Motor (vLLM, Fase 6a)
+
+Solo existen para workers con un motor real (el adaptador de vLLM); con workers simulados no hay series.
+
+| Métrica | Tipo | Etiquetas | Qué mide | Por qué |
+| :--- | :--- | :--- | :--- | :--- |
+| `llmplatform_worker_engine_kv_cache_usage` | G·S | `worker` | Ocupación real de la KV-Cache (0–1) según el motor | Comparada con `worker_tokens_reserved / worker_token_budget`, mide el coste de la reserva pesimista (**FI-1**). |
+| `llmplatform_worker_engine_requests_running` | G·S | `worker` | Peticiones que el motor está ejecutando | Debería seguir a `worker_leases_active`. |
+| `llmplatform_worker_engine_requests_waiting` | G·S | `worker` | Peticiones en la cola **propia** del motor | Con la admisión del control plane debería ser ~0; si crece, admitimos más de lo que el motor procesa. |
+| `llmplatform_prompt_token_estimate_ratio` | H·E | `model` | Tokens de prompt estimados / reales (los del motor) | El error de `tokens.Estimate` contra el tokenizer real (**FI-3**): 1 = exacto. |
+
+Con un motor real, `prompt_tokens_total` y `generation_tokens_total` llevan sus cifras exactas (FI-8), y las métricas `worker_prefix_cache_*` salen de sus contadores (en tokens, convertidos a bloques).
 
 **Contadores que existen desde el principio.** Los contadores de eventos con etiquetas conocidas (`requests_total` por `outcome`, `worker_failures_total`, `breaker_transitions_total`, `health_checks_total`, `worker_restarts_detected_total`, `retries_total`, `admissions_total`…) se crean a 0 para cada worker y modelo en el primer *scrape*. Sin eso, una serie nacería con valor 1 en su primer evento e `increase()` no lo vería: la primera apertura del breaker de un worker no aparecería en ningún panel ni anotación. Por eso las leyendas listan combinaciones que nunca ocurrieron; los paneles de fallos filtran con `> 0`.
 
@@ -438,7 +453,7 @@ Con vLLM, Prometheus hará *scrape* también del `/metrics` de cada servidor vLL
 | `worker_prefix_cache_hit_blocks_total / …queried…` | `prefix_cache_hits` / `prefix_cache_queries` (en tokens) | Acierto real de la caché; vLLM cuenta tokens, nosotros bloques de 16. |
 | — | `num_preemptions` | Expulsiones por falta de memoria: con la reserva pesimista deberían ser ~0; si se relaja (FI-1), es la métrica que vigilar. |
 
-El dashboard añadirá en la Fase 6 una fila "Motor (vLLM)" con estas comparaciones.
+Desde la Fase 6a, el dashboard tiene una fila **6 · Motor (vLLM)** con la comparación clave (*KV-Cache real frente a reserva del ledger*), la cola propia del motor y el error de estimación de tokens. Con el stack `task stack:up:fake-vllm`, Prometheus lee también el `/metrics` de los motores (`job="vllm"`), como hará con vLLM real: las métricas `vllm:*` se pueden consultar directamente. **Con el vLLM falso las magnitudes son inventadas** ([13](13-fase-6a-decisiones.md#lo-que-el-falso-no-puede-decir-pendiente-de-la-6b)): la fila sirve para comprobar el camino de los datos, no para sacar conclusiones.
 
 ## Limitaciones
 

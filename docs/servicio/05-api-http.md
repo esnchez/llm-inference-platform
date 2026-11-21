@@ -43,10 +43,12 @@ Las rutas usan los patrones con método de `net/http` (Go ≥ 1.22): un `GET` a 
 | Campo | Uso |
 | :--- | :--- |
 | `model` | Obligatorio. Debe servirlo algún worker, si no `404`. |
-| `messages` | Obligatorio, no vacío. Se aplana a texto solo para estimar tokens. |
+| `messages` | Obligatorio, no vacío. Cada mensaje con `role` y `content` **de texto** (un `content` en partes, multimodal, → `400`); `name` opcional. Se reenvían al motor tal cual y, aplanados, sirven para estimar tokens y para los hashes de prefijo. |
 | `max_completion_tokens` / `max_tokens` | Por este orden de preferencia; si no vienen, 256. Rango 1..`max-tokens-limit`. |
 | `stream` | `true` → SSE. |
-| `stream_options.include_usage` | Añade un chunk final con `usage`. |
+| `stream_options.include_usage` | Añade un chunk final con `usage`. Con un motor real, `usage` lleva los tokens que contó el motor (FI-8); con el simulador, la estimación y los chunks. |
+| `n`, `best_of` (≠ 1), `logprobs` (`true`), `top_logprobs`, `prompt_logprobs`, `tools`, `tool_choice`, `functions`, `function_call` | **`400`** con la lista de campos y el motivo: la plataforma no sabría reservar capacidad para varias respuestas ni devolver logprobs o llamadas a herramientas (Fase 6a). `null` equivale a ausente. |
+| Cualquier otro (`temperature`, `top_p`, `stop`, `seed`, `presence_penalty`, `response_format`, `top_k`, `min_p`…) | Se **reenvía al motor sin interpretar** (Fase 6a). El simulador los ignora; vLLM los aplica o responde `400` si no los conoce. |
 
 Campos aceptados por OpenAI pero **ignorados** hoy: `temperature`, `top_p`, `stop`, `n`, `tools`, etc. El decodificador JSON no es estricto, así que no provocan error. Cuando exista el adaptador de vLLM habrá que reenviarlos (ver [06](06-relacion-con-vllm.md)).
 

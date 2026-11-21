@@ -11,6 +11,7 @@ vars:
   COVER_FILE: coverage.out
   # Local observability stack (Phase 5).
   STACK_FILE: deploy/observability/docker-compose.yml
+  STACK_FAKE_VLLM: deploy/observability/docker-compose.fake-vllm.yml
 
 tasks:
   default:
@@ -38,6 +39,7 @@ tasks:
     cmds:
       - go build -o bin/platform{{exeExt}} ./cmd/platform
       - go build -o bin/loadgen{{exeExt}} ./cmd/loadgen
+      - go build -o bin/fakevllm{{exeExt}} ./cmd/fakevllm
 
   # ---- observability stack (Phase 5, docs/servicio/12-observabilidad.md) ----
 
@@ -48,10 +50,17 @@ tasks:
       - cmd: 'echo "Grafana: http://localhost:3000  Prometheus: http://localhost:9090  API: http://localhost:8080"'
         silent: true
 
-  stack:down:
-    desc: Stop and remove the observability stack (its data is not kept)
+  stack:up:fake-vllm:
+    desc: "Like stack:up, but the platform talks over HTTP to 3 fake vLLM servers (Phase 6a; break them on :8001-8003/fake/faults)"
     cmds:
-      - docker compose -f {{.STACK_FILE}} down
+      - docker compose -f {{.STACK_FILE}} -f {{.STACK_FAKE_VLLM}} up -d --build
+      - cmd: 'echo "Grafana: http://localhost:3000  Prometheus: http://localhost:9090  API: http://localhost:8080  fake vLLM: :8001-8003"'
+        silent: true
+
+  stack:down:
+    desc: Stop and remove the observability stack, either variant (its data is not kept)
+    cmds:
+      - docker compose -f {{.STACK_FILE}} down --remove-orphans
 
   stack:logs:
     desc: Follow the platform's JSON logs in the stack

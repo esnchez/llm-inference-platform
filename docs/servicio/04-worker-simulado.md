@@ -2,6 +2,8 @@
 
 El proyecto arranca sin GPU. `simworker.Worker` imita lo suficiente el comportamiento de un servidor de inferencia como para probar el control plane (admisión, streaming, cancelación, concurrencia) con miles de peticiones locales.
 
+Desde la Fase 6a, la contabilidad (presupuesto, leases, TTL, `CapacityChanged`) vive en `internal/ledger`, compartida con el adaptador de vLLM; este paquete solo simula cómo se ejecuta un stream. El simulador ignora `Messages` y `Params` (sus salidas son palabras falsas) y no informa `Usage`: la API cuenta chunks, como antes. Para probar el camino HTTP sin GPU está el **vLLM falso** (`internal/vllm/fakevllm`, [13](13-fase-6a-decisiones.md#decisión-9-cómo-se-prueba)), que es otra cosa: imita la API de vLLM, no una GPU.
+
 ## Qué simula y qué no
 
 | Aspecto de una GPU con vLLM | Simulación | Fidelidad |

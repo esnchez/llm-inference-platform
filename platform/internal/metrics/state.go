@@ -52,6 +52,11 @@ var (
 	dDegraded = desc("worker_degraded", "1 if the worker's inter-token latency exceeds 2x its peers' median.", "worker")
 	dDraining = desc("worker_draining", "1 while the worker drains after removal.", "worker")
 	dITLEWMA  = desc("worker_itl_ewma_seconds", "Mean inter-token latency the scheduler uses for the degraded mark.", "worker")
+
+	// Engine (vLLM, Phase 6a): what the engine reports about itself.
+	dEngineKV      = desc("worker_engine_kv_cache_usage", "Real KV-cache occupancy reported by the engine (0-1), to compare with the ledger's reservation (FI-1).", "worker")
+	dEngineRunning = desc("worker_engine_requests_running", "Requests the engine is running.", "worker")
+	dEngineWaiting = desc("worker_engine_requests_waiting", "Requests waiting in the engine's own queue.", "worker")
 )
 
 var breakerStates = []string{"closed", "open", "half_open"}
@@ -108,6 +113,11 @@ func (c *stateCollector) Collect(ch chan<- prometheus.Metric) {
 			counter(dCacheHit, float64(s.PrefixBlocksHit), w)
 			gauge(dCacheUsed, float64(s.PrefixCacheUsed), w)
 			gauge(dCacheCapacity, float64(s.PrefixCacheBlocks), w)
+		}
+		if e := s.Engine; e != nil {
+			gauge(dEngineKV, e.KVCacheUsage, w)
+			gauge(dEngineRunning, float64(e.RequestsRunning), w)
+			gauge(dEngineWaiting, float64(e.RequestsWaiting), w)
 		}
 		if st := s.Status; st != nil {
 			gauge(dHealthy, b2f(st.Healthy), w)

@@ -1,0 +1,33 @@
+# Variant of the stack (Phase 6a): the platform with no simulated workers,
+# talking over HTTP to three fake vLLM servers (cmd/fakevllm), exactly as it
+# will talk to vLLM on GPUs in Phase 6b. Start it with
+# `task stack:up:fake-vllm`; it is layered on docker-compose.yml.
+#
+# The fakes load "the model" for 10 s at start: the platform registers each
+# one when it is ready (log "vllm registered"). Break one from the host with
+#   curl -X POST localhost:8001/fake/faults -d '{"status":500}'   ({} repairs)
+#   curl -X POST localhost:8001/fake/restart
+services:
+  platform:
+    command: ["-addr", ":8080", "-workers", "0",
+              "-vllm", "http://fakevllm-1:8000,http://fakevllm-2:8000,http://fakevllm-3:8000"]
+
+  fakevllm-1: &fakevllm
+    build:
+      context: ../../platform
+      args: {CMD: fakevllm}
+    command: ["-addr", ":8000", "-model", "sim-llama-3-8b", "-num-gpu-blocks", "1024", "-max-model-len", "8192",
+              "-ttft", "60ms", "-itl", "20ms", "-loading-for", "10s"]
+    ports: ["8001:8000"]
+    restart: unless-stopped
+  fakevllm-2:
+    <<: *fakevllm
+    ports: ["8002:8000"]
+  fakevllm-3:
+    <<: *fakevllm
+    ports: ["8003:8000"]
+
+  prometheus:
+    volumes:
+      - ./prometheus/prometheus-fake-vllm.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro

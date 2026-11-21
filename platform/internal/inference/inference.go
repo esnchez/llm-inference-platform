@@ -4,6 +4,7 @@ package inference
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -80,6 +81,14 @@ const (
 	FinishLength FinishReason = "length"
 )
 
+// Message is one chat message, as the client sent it (Phase 6a, FI-7): the
+// engine applies the model's chat template to these.
+type Message struct {
+	Role    string
+	Content string
+	Name    string // optional
+}
+
 // InferenceRequest is the unit of work routed by the control plane.
 type InferenceRequest struct {
 	ID     string
@@ -95,6 +104,16 @@ type InferenceRequest struct {
 	// prefix cache may use them to skip the prefill of cached blocks. Nil
 	// disables both.
 	PrefixHashes []uint64
+	// Messages are the client's chat messages, for engines that apply a
+	// chat template (vLLM). Prompt is their flattened form, used for token
+	// estimation and prefix hashing (Phase 6a, FI-7).
+	Messages []Message
+	// Params are the client's generation parameters that the control plane
+	// does not interpret (temperature, top_p, stop, seed, ...), forwarded
+	// to the engine as they came. Fields the platform controls (model,
+	// max_tokens, stream, ...) or rejects (n > 1, tools, logprobs, ...)
+	// never appear here (Phase 6a, decision 1).
+	Params map[string]json.RawMessage
 }
 
 // TokenCost is the capacity a request reserves on a worker: its input tokens
@@ -104,12 +123,23 @@ func (r InferenceRequest) TokenCost() int {
 	return r.PromptTokens + r.MaxNewTokens
 }
 
+// Usage is the engine's own token count for a request (Phase 6a, FI-8).
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+}
+
 // TokenChunk is one streamed piece of generated output.
 type TokenChunk struct {
-	// Index is the 0-based position of the token in the generated sequence.
+	// Index is the 0-based position of the chunk in the stream. A chunk is
+	// usually one token, but an engine may group several (FI-8): count
+	// tokens with Usage when it is present.
 	Index        int
 	Text         string
 	FinishReason FinishReason
+	// Usage is set on the last chunk by workers that know the real token
+	// counts (vLLM); nil otherwise (the simulator).
+	Usage *Usage
 }
 
 // WorkerSnapshot is a point-in-time, read-only view of a worker's state. It is
@@ -122,6 +152,10 @@ type WorkerSnapshot struct {
 	ActiveLeases   int      `json:"active_leases"`
 	LeasesGranted  uint64   `json:"leases_granted"`
 	LeasesRejected uint64   `json:"leases_rejected"`
+	// MaxRequestTokens is the largest prompt + max_tokens one request may
+	// have when it is below TokenBudget (vLLM's max_model_len); 0 means
+	// TokenBudget (Phase 6a).
+	MaxRequestTokens int `json:"max_request_tokens,omitempty"`
 	// Prefix cache (Phase 3), the worker's own ground truth. Zero when the
 	// worker has no prefix cache. PrefixBlocksHit / PrefixBlocksQueried is
 	// the real cache hit rate, to compare with the router's prediction.
@@ -129,9 +163,22 @@ type WorkerSnapshot struct {
 	PrefixCacheUsed     int    `json:"prefix_cache_used,omitempty"`
 	PrefixBlocksQueried uint64 `json:"prefix_blocks_queried,omitempty"`
 	PrefixBlocksHit     uint64 `json:"prefix_blocks_hit,omitempty"`
+	// Engine is what a real engine reports about itself (vLLM's /metrics,
+	// Phase 6a); nil for workers without one (the simulator).
+	Engine *EngineStats `json:"engine,omitempty"`
 	// Status is the control plane's view of the worker (Phase 4). Workers
 	// leave it nil; the scheduler fills it in its own snapshots.
 	Status *WorkerStatus `json:"status,omitempty"`
+}
+
+// EngineStats is the engine's own view, read periodically (never per
+// request): the real KV-cache occupancy, to compare with the ledger's
+// pessimistic reservation (FI-1).
+type EngineStats struct {
+	KVCacheUsage     float64 `json:"kv_cache_usage"` // 0–1
+	RequestsRunning  int     `json:"requests_running"`
+	RequestsWaiting  int     `json:"requests_waiting"`
+	ScrapedAtUnixSec int64   `json:"scraped_at"`
 }
 
 // WorkerStatus is the scheduler's view of a worker's lifecycle and health.

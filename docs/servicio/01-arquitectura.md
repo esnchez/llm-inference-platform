@@ -44,11 +44,16 @@ platform/
 ├── go.mod
 ├── cmd/platform/          wiring: flags, creación de workers, servidor HTTP, apagado ordenado, /debug de administración
 ├── cmd/loadgen/           generador de carga contra un servidor en marcha (solo HTTP)
+├── cmd/fakevllm/          vLLM falso como binario, para el stack (Fase 6a)
 └── internal/
     ├── inference/         contrato core (sin dependencias internas)
     ├── tokens/            estimación de tokens
     ├── prefix/            hashes de prefijo por bloque y radix tree de prefijos (Fase 3)
-    ├── simworker/         implementación simulada de Worker/Lease, con fallos inyectables
+    ├── ledger/            contabilidad de capacidad compartida: presupuesto, lease con TTL, CapacityChanged (Fase 6a)
+    ├── simworker/         worker simulado sobre el ledger, con fallos inyectables
+    ├── vllm/              VLLMAdapter: worker sobre el ledger que habla con vLLM por HTTP (Fase 6a)
+    │   └── fakevllm/      vLLM falso para tests y para el stack
+    ├── workertest/        batería de contrato común a todos los workers (tests)
     ├── scheduler/         admisión, colocación, registro de workers, salud, breaker y reintentos
     ├── httpapi/           API HTTP OpenAI-compatible, SSE
     └── metrics/           métricas Prometheus: implementa los observadores y lee el estado (Fase 5)
@@ -65,7 +70,10 @@ flowchart LR
     loadgen[cmd/loadgen] -. HTTP .-> main
     httpapi --> inference & tokens & prefix
     scheduler --> inference & prefix
-    simworker --> inference & prefix
+    simworker --> inference & prefix & ledger
+    vllm --> inference & ledger
+    ledger --> inference
+    main --> vllm
     prefix --> tokens
 ```
 
@@ -77,11 +85,11 @@ Define los tipos que cruzan la frontera control/data plane:
 
 | Tipo | Papel |
 | :--- | :--- |
-| `InferenceRequest` | Unidad de trabajo: `ID`, `Model`, `Prompt`, `PromptTokens` (estimados), `MaxNewTokens` y, desde la Fase 3, `PrefixHashes` (hashes encadenados de los bloques del prompt; opcional). `TokenCost()` = `PromptTokens + MaxNewTokens`. |
-| `TokenChunk` | Un trozo de salida: `Index`, `Text`, `FinishReason` (solo en el último). |
+| `InferenceRequest` | Unidad de trabajo: `ID`, `Model`, `Prompt` (aplanado), `PromptTokens` (estimados), `MaxNewTokens`; desde la Fase 3, `PrefixHashes`; desde la Fase 6a, `Messages` (los mensajes tal cual, para la *chat template* del motor) y `Params` (parámetros reenviados sin interpretar). `TokenCost()` = `PromptTokens + MaxNewTokens`. |
+| `TokenChunk` | Un trozo de salida: `Index` (del chunk, no del token: FI-8), `Text`, `FinishReason` y, en el último, `Usage` (los tokens reales del motor, si los conoce). |
 | `Worker` | `ID`, `Models`, `AcquireLease`, `Snapshot`, `CapacityChanged` (Fase 2, señal agrupada de capacidad liberada) y `Health` (Fase 4, devuelve un `HealthStatus` con el `InstanceID` del proceso). |
 | `Lease` | `WorkerID`, `ExecuteStream`, `Release`. |
-| `WorkerSnapshot` | Vista informativa del estado de un worker (presupuesto, reservado, leases y, si tiene caché de prefijos, su tamaño y sus aciertos). |
+| `WorkerSnapshot` | Vista informativa del estado de un worker: presupuesto, reservado, leases, `MaxRequestTokens` (el `max_model_len` del motor), caché de prefijos y, para un motor real, `Engine` (ocupación real de KV-Cache, peticiones en ejecución y en espera). |
 | Errores | `ErrAtCapacity`, `ErrRequestTooLarge`, `ErrModelNotServed`, `ErrModelNotFound`, `ErrInvalidRequest`, `ErrLeaseUsed`, `ErrLeaseReleased`, `ErrLeaseExpired`, `ErrQueueFull`, `ErrQueueTimeout` y, desde la Fase 4, `ErrWorkerFailure` (fallo del propio worker, no de la petición) y `ErrNoHealthyWorkers`. |
 | `RetryAfterError` | Envuelve un error de cola con el `Retry-After` que calcula el scheduler; se lee con `errors.As`. |
 | `StartStream` | Helper que ejecuta `ExecuteStream` en una goroutine y devuelve un canal que se cierra al terminar más una función `wait()` con el error. |
@@ -100,6 +108,14 @@ El detalle del contrato está en [03 · Leases y capacidad](03-leases-y-capacida
 - `Tree` es un radix tree sobre esas secuencias que recuerda qué workers tienen qué prefijos, con una capacidad LRU por worker. Es la aproximación del router a las cachés reales de los workers.
 
 No depende del scheduler ni de los workers (solo de `tokens`), así que se prueba aislado. Ver [09 · Fase 3](09-fase-3-routing-por-prefijos.md).
+
+### `internal/ledger` — la contabilidad compartida (Fase 6a)
+
+El presupuesto con su mutex, `Acquire` atómico, el lease con su máquina de estados y su TTL, y la señal `CapacityChanged()`. Un worker solo aporta un `Executor`: la función que ejecuta un stream. Lo usan `simworker` y el adaptador de vLLM, así que la parte más delicada en concurrencia existe una sola vez, y `internal/workertest` comprueba que ambos cumplen el mismo contrato. Ver [03](03-leases-y-capacidad.md).
+
+### `internal/vllm` — el adaptador de vLLM (Fase 6a)
+
+Un `inference.Worker` sobre el ledger cuyo `Executor` llama a `POST /v1/chat/completions` de un servidor vLLM y traduce su stream SSE a `TokenChunk`. Un `Connector` por URL descubre el servidor (modelos, `max_model_len`, tamaño de la KV-Cache) y lo registra en el scheduler cuando está listo. Ver [06](06-relacion-con-vllm.md#el-vllmadapter-fase-6a) y [13](13-fase-6a-decisiones.md).
 
 ### `internal/simworker` — el data plane simulado
 
@@ -218,13 +234,16 @@ Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_g
 | `-ttft-timeout` | `10s` | Sin primer token en este tiempo (+1 ms por token de prompt): worker colgado. |
 | `-stall-timeout` | `10s` | Sin token nuevo en este tiempo a mitad de stream: worker colgado. |
 | `-max-retries` | `1` | Reintentos en otro worker si uno falla antes del primer token; `-1` los desactiva. |
+| `-vllm` | vacío | URLs de servidores vLLM separadas por comas (Fase 6a); cada uno se registra cuando está listo. Con `-workers 0`, solo vLLM. |
+| `-vllm-api-key` | `$VLLM_API_KEY` | API key de vLLM (`Authorization: Bearer`). |
+| `-vllm-token-budget` | `0` (descubrir) | Presupuesto de cada worker vLLM si `vllm:cache_config_info` no está disponible. |
 | `-shutdown-grace` | `15s` | Gracia para los streams en curso al apagar. |
 
 ## Cómo se separará en procesos más adelante
 
 | Hoy (en memoria) | Futuro |
 | :--- | :--- |
-| `simworker.Worker` en el mismo proceso | Pod de vLLM con GPU; `VLLMAdapter` en el control plane habla con él por HTTP (Fase 6). |
+| `simworker.Worker` en el mismo proceso | **Hecho (6a):** `vllm.Worker` habla por HTTP con un vLLM (hoy, el falso); en la 6b, con pods de vLLM con GPU. |
 | Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el *watch* de los Endpoints de Kubernetes (Fase 7). |
 | Healthchecks contra `simworker.Health` | `GET /health` de vLLM desde el `VLLMAdapter` (Fase 6). |
 | `/metrics` y `/debug` en el puerto de la API | Puerto de administración solo accesible dentro del clúster (FI-10, Fase 7). |

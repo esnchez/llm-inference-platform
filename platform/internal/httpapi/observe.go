@@ -36,9 +36,15 @@ type RequestRecord struct {
 	FirstToken bool
 	TTFT       time.Duration
 	Duration   time.Duration
-	// Token counts of admitted requests: prompt (estimated), generated and
-	// reserved in the worker's ledger (prompt + max_tokens).
+	// Token counts of admitted requests: prompt, generated and reserved in
+	// the worker's ledger (estimated prompt + max_tokens). Prompt and
+	// completion are the engine's own counts when UsageReported (vLLM,
+	// FI-8); otherwise the estimate and the number of chunks.
 	PromptTokens, CompletionTokens, ReservedTokens int
+	UsageReported                                  bool
+	// EstimatedPromptTokens is tokens.Estimate's count, set when
+	// UsageReported, to measure the estimation error (FI-3).
+	EstimatedPromptTokens int
 }
 
 // Outcomes of a request: each request ends in exactly one.

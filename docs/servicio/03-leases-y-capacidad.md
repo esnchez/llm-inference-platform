@@ -57,6 +57,8 @@ Reglas que toda implementación (simulada o vLLM) debe cumplir:
 | Un lease no ejecutado **expira** tras el TTL (`ErrLeaseExpired`). | Un lease que nadie ejecuta (bug, *panic*, cliente perdido entre admisión y stream) retendría capacidad para siempre. |
 | Los errores se comparan con `errors.Is`. | Las implementaciones pueden añadir contexto (`"w1: at capacity"`) sin romper la clasificación. |
 
+**Desde la Fase 6a, estas reglas se implementan una sola vez**, en `internal/ledger`, y las usan tanto `simworker` como el adaptador de vLLM. Cada worker solo aporta un `Executor` (cómo se ejecuta un stream). La batería `internal/workertest` comprueba el contrato (admisión, un solo uso, cancelación, TTL, señal de capacidad, concurrencia) contra ambas implementaciones. Además, el ledger admite un límite por petición (`MaxRequestTokens`, el `max_model_len` del motor): una petición que cabe en el presupuesto pero lo supera da `ErrRequestTooLarge`, y el scheduler la rechaza con `400` sin encolarla.
+
 Reglas añadidas en la Fase 4 ([10](10-fase-4-decisiones.md)):
 
 | Regla | Motivo |
@@ -80,7 +82,7 @@ for c := range chunks {                      // el canal se cierra al terminar
 err = wait()                                 // error de ExecuteStream
 ```
 
-## Máquina de estados del lease (simworker)
+## Máquina de estados del lease (`internal/ledger`)
 
 ```mermaid
 stateDiagram-v2

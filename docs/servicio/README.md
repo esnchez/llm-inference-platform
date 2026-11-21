@@ -1,6 +1,6 @@
 # Documentación del servicio
 
-Esta carpeta explica **cómo funciona la implementación actual** (Fases 1 a 5) de la plataforma: qué hace cada componente, cómo viaja una petición de principio a fin, por qué está diseñado así y qué relación tiene cada pieza con los workers reales de vLLM que la sustituirán.
+Esta carpeta explica **cómo funciona la implementación actual** (Fases 1 a 5 y 6a) de la plataforma: qué hace cada componente, cómo viaja una petición de principio a fin, por qué está diseñado así y qué relación tiene cada pieza con los workers reales de vLLM que la sustituirán.
 
 El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitectura y el roadmap. Estos documentos bajan al nivel del código.
 
@@ -22,6 +22,7 @@ El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitec
 | 10 | [Fase 4: decisiones de diseño](10-fase-4-decisiones.md) | Resiliencia: registro de workers en caliente con drenaje, healthchecks, circuit breaker, workers degradados, reintento antes del primer token, clasificación de errores, fallos simulados y mediciones con caos. |
 | 11 | [Fase 5: decisiones de diseño](11-fase-5-decisiones.md) | Librería de métricas, arquitectura de la instrumentación, logs, stack local con Prometheus y Grafana, alcance, y lo que se encontró al validar. |
 | 12 | [Observabilidad](12-observabilidad.md) | **Guía de uso.** Cómo arrancar el stack, qué se mide y por qué, catálogo de métricas, el dashboard panel a panel y cómo leerlo, un ejemplo de lectura con una captura real, guía de diagnóstico, logs, SLO y alertas, relación con las métricas de vLLM. |
+| 13 | [Fase 6a: decisiones de diseño](13-fase-6a-decisiones.md) | Adaptador vLLM sin GPU, implementado: petición completa en el contrato, tokens reales, ledger compartido, descubrimiento de workers, traducción de errores, métricas del motor, vLLM falso, empaquetado; y lo que el falso no puede decir. |
 
 ## Glosario rápido
 

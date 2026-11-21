@@ -41,6 +41,7 @@ type member struct {
 	w      inference.Worker
 	id     string
 	budget int
+	maxReq int // largest single request (0: budget): vLLM's max_model_len
 	models []string
 	stop   chan struct{} // closed on removal: stops the health loop
 
@@ -87,7 +88,7 @@ type forgetter interface {
 func (s *Scheduler) AddWorker(w inference.Worker) error {
 	snap := w.Snapshot() // static configuration: budget
 	mem := &member{
-		w: w, id: w.ID(), budget: snap.TokenBudget, models: w.Models(),
+		w: w, id: w.ID(), budget: snap.TokenBudget, maxReq: snap.MaxRequestTokens, models: w.Models(),
 		stop: make(chan struct{}), healthy: true,
 	}
 	s.mu.Lock()
@@ -164,7 +165,11 @@ func (s *Scheduler) recomputeLocked() {
 		for _, name := range mem.models {
 			m := s.byModel[name]
 			m.serving++
-			m.maxBudget = max(m.maxBudget, mem.budget)
+			largest := mem.budget
+			if mem.maxReq > 0 {
+				largest = min(largest, mem.maxReq) // conflict C3 of Phase 6a
+			}
+			m.maxBudget = max(m.maxBudget, largest)
 			m.tokenLimit += mem.budget
 		}
 	}
