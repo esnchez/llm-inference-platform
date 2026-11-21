@@ -1,6 +1,6 @@
 # 2. Recorrido de una petición
 
-Este documento sigue una petición de chat desde que llega hasta que se libera su capacidad. Todo el código está en `internal/httpapi/server.go` (`handleChatCompletions`, `stream`, `collect`) salvo donde se indica.
+Este documento sigue una petición de chat desde que llega hasta que se libera su capacidad. Todo el código está en `internal/httpapi/server.go` (`handleChatCompletions`, `stream`, `collect`) salvo donde se indica. El diagrama usa un worker simulado; con vLLM, el lease es el del adaptador y el stream llega por HTTP ([06](06-relacion-con-vllm.md#el-vllmadapter-fase-6a)), con el mismo recorrido.
 
 ## Vista general
 
@@ -27,15 +27,17 @@ sequenceDiagram
     P->>P: Tree.Insert(worker elegido, PrefixHashes)
     P-->>API: Lease (o error → 4xx/503, fin)
     Note over API: defer lease.Release()
-    API->>C: 200 + cabeceras SSE
     API->>G: StartStream(ctx, lease, 16)
     G->>L: ExecuteStream(ctx, out)
     L->>L: espera TTFT (prefill de lo no cacheado)
+    L-->>G: primer TokenChunk
+    G-->>API: chunk
+    API->>C: 200 + cabeceras SSE (con el primer token, Fase 4)
     loop cada token
-        L-->>G: TokenChunk (canal out)
-        G-->>API: chunk
         API->>C: data: {chat.completion.chunk}
         L->>L: espera ITL (decode)
+        L-->>G: TokenChunk (canal out)
+        G-->>API: chunk
     end
     L->>W: libera tokens (al retornar)
     L-->>G: nil
@@ -67,15 +69,15 @@ sequenceDiagram
 | `MaxNewTokens` | El `max_tokens` resuelto en el paso 1. |
 | `Messages` | Los mensajes del cliente tal cual (Fase 6a): el adaptador de vLLM se los envía al motor, que aplica la *chat template* del modelo. |
 | `Params` | Los campos que la plataforma no controla (`temperature`, `top_p`, `stop`, `seed`, `response_format`, extras de vLLM…), sin interpretar. |
-| `PrefixHashes` | `prefix.Hashes(model, Prompt)`: un hash encadenado por cada bloque completo de 64 caracteres (16 tokens estimados). `nil` si el prompt es más corto. Se calcula aquí, una vez, porque la colocación puede intentarse muchas veces mientras la petición espera en la cola ([09 · Decisión 2](09-fase-3-routing-por-prefijos.md#decisión-2-dónde-se-calculan-los-hashes)). |
+| `PrefixHashes` | `prefix.Hashes(model, Prompt)`: un hash encadenado por cada bloque completo de 64 caracteres (16 tokens estimados). `nil` si el prompt es más corto. Se calcula aquí, una vez, porque la colocación puede intentarse muchas veces mientras la petición espera en la cola ([10 · Decisión 2](10-fase-3-decisiones.md#decisión-2-dónde-se-calculan-los-hashes)). |
 
 `renderPrompt` **no** es una *chat template* real: solo sirve para estimar el coste. Ver [06 · Relación con vLLM](06-relacion-con-vllm.md) para lo que implica.
 
 ### 3. Admisión: obtener un lease
 
-`s.sched.Acquire(r.Context(), req)` intenta un lease y, si no hay capacidad, espera en la cola del modelo hasta que el dispatcher se lo entregue o venza el timeout (ver [01 · Arquitectura](01-arquitectura.md#internalscheduler--admisión-y-colocación-fase-2)). Durante la espera el cliente no recibe ningún byte.
+`s.sched.Acquire(r.Context(), req)` intenta un lease y, si no hay capacidad, espera en la cola del modelo hasta que el dispatcher se lo entregue o venza el timeout (ver [01 · Arquitectura](01-arquitectura.md#internalscheduler--admisión-colocación-y-ciclo-de-vida-fases-2-a-4)). Durante la espera el cliente no recibe ningún byte.
 
-Con la colocación por defecto del binario (`PrefixAffinity`, Fase 3), cada intento de colocación consulta el radix tree y prueba primero los workers que tienen el prefijo más largo de la petición y no están cargados, y después el resto del menos al más cargado. Al conceder el lease, el prefijo queda registrado para ese worker. Ver [09 · Cómo funciona](09-fase-3-routing-por-prefijos.md#cómo-funciona). Si falla, `writeAdmissionError` elige la respuesta:
+Con la colocación por defecto del binario (`PrefixAffinity`, Fase 3), cada intento de colocación consulta el radix tree y prueba primero los workers que tienen el prefijo más largo de la petición y no están cargados, y después el resto del menos al más cargado. Al conceder el lease, el prefijo queda registrado para ese worker. Ver [10 · Cómo funciona](10-fase-3-decisiones.md#cómo-funciona). Si falla, `writeAdmissionError` elige la respuesta:
 
 | Error | Respuesta |
 | :--- | :--- |
@@ -102,7 +104,7 @@ defer cancel()
 
 ### 4. Cabeceras
 
-**Desde la Fase 4, las cabeceras esperan al primer chunk.** Hasta que llega el primer token, el lease del scheduler puede reintentar la petición en otro worker, y si todo falla el handler todavía puede responder con un código real: `503 worker_unavailable`, o `400` si el motor rechaza la petición al empezar. Así se resuelve **FI-9** ([10 · Decisión 4](10-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9)). Para el cliente apenas cambia nada: de todas formas no recibía nada útil antes del primer token.
+**Desde la Fase 4, las cabeceras esperan al primer chunk.** Hasta que llega el primer token, el lease del scheduler puede reintentar la petición en otro worker, y si todo falla el handler todavía puede responder con un código real: `503 worker_unavailable`, o `400` si el motor rechaza la petición al empezar. Así se resuelve **FI-9** ([11 · Decisión 4](11-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9)). Para el cliente apenas cambia nada: de todas formas no recibía nada útil antes del primer token.
 
 Con el primer chunk se envían `200` y:
 
@@ -130,7 +132,7 @@ Cuando el canal se cierra, `wait()` devuelve el error de `ExecuteStream`:
 
 | Resultado | Qué se envía después de los tokens |
 | :--- | :--- |
-| Éxito y `stream_options.include_usage: true` | Un chunk con `choices: []` y `usage` (`prompt_tokens` estimados, `completion_tokens` contados). |
+| Éxito y `stream_options.include_usage: true` | Un chunk con `choices: []` y `usage`: los tokens que contó el motor si los informa (vLLM, Fase 6a); con el simulador, `prompt_tokens` estimados y `completion_tokens` contados. |
 | Éxito | — |
 | Error antes del primer token (reintento incluido) | No hay stream: respuesta de error con su código (`503 worker_unavailable`, `400`, …) y sin `[DONE]`. |
 | Error con `ctx` vivo después del primer token | `data: {"error": {...}}` *en banda*, porque el `200` ya se envió. No se reintenta. |
@@ -144,7 +146,7 @@ La capacidad se libera **cuando `ExecuteStream` retorna** (lo hace el propio lea
 
 ### 8. Log y métricas
 
-Al terminar, la petición deja **un log y un registro de métricas**, sea cual sea el resultado (Fase 5, ver [12 · Observabilidad](12-observabilidad.md)). Ambos llevan el mismo `outcome`: cada petición acaba en exactamente uno (`completed`, `cancelled`, `rejected_invalid`, `rejected_queue_full`, `rejected_queue_timeout`, `rejected_no_healthy_workers`, `worker_unavailable`, `failed_midstream` o `error`).
+Al terminar, la petición deja **un log y un registro de métricas**, sea cual sea el resultado (Fase 5, ver [observabilidad · Observabilidad](../operaciones/03-observabilidad.md)). Ambos llevan el mismo `outcome`: cada petición acaba en exactamente uno (`completed`, `cancelled`, `rejected_invalid`, `rejected_queue_full`, `rejected_queue_timeout`, `rejected_no_healthy_workers`, `worker_unavailable`, `failed_midstream` o `error`).
 
 Campos del log: `request_id`, `model`, `outcome`, `http_status`, `prompt_tokens`, `max_new_tokens`, `stream`, `completion_tokens`, `duration_ms`, `ttft_ms` y, si hubo lease, `worker_id`, `queue_wait_ms`, `retries` y `worker_ttft_ms`.
 

@@ -1,6 +1,6 @@
-# 9. Fase 3: routing por prefijos (KV-Cache)
+# 10. Fase 3: routing por prefijos (KV-Cache)
 
-Este documento explica la Fase 3: qué problema resuelve el routing por afinidad de prefijo, cómo está implementado, qué decisiones se tomaron (con sus alternativas) y qué se midió. Cómo encaja cada pieza en el resto del servicio está también en los documentos 1–7.
+Este documento explica la Fase 3: qué problema resuelve el routing por afinidad de prefijo, cómo está implementado, qué decisiones se tomaron (con sus alternativas) y un resumen de lo que se midió (el detalle está en [operaciones · resultados](../operaciones/04-resultados-de-pruebas.md)). Cómo encaja cada pieza en el resto del servicio está también en los documentos 1–7.
 
 > **Estado (2026-11-17):** implementada. Las decisiones se tomaron al implementar, con la opción recomendada en cada caso; a diferencia de la Fase 2, no hubo una ronda de aprobación previa. Si alguna se revisa, este documento es el sitio donde registrarlo.
 
@@ -42,7 +42,7 @@ flowchart LR
 3. **Colocación (`internal/scheduler/affinity.go`).** `PrefixAffinity` implementa la interfaz `Placement` de la Fase 2. Ordena los workers, prueba `AcquireLease` en ese orden (el primero que concede gana, como en round-robin) y registra el prefijo en el árbol para el worker elegido.
 4. **Caché simulada (`internal/simworker/prefixcache.go`).** El worker simulado tiene su propia caché LRU de bloques: la "verdad" que el árbol intenta aproximar. El TTFT pasa a ser `BaseTTFT + PrefillPerToken × tokens no cacheados`.
 
-La admisión (cola por modelo, barrera FIFO, límites, `503`) **no cambia**: era el objetivo de separar admisión y colocación en la Fase 2 ([08 · Decisión 3](08-fase-2-decisiones.md#decisión-3-separar-admisión-y-colocación)).
+La admisión (cola por modelo, barrera FIFO, límites, `503`) **no cambia**: era el objetivo de separar admisión y colocación en la Fase 2 ([09 · Decisión 3](09-fase-2-decisiones.md#decisión-3-separar-admisión-y-colocación)).
 
 ## Resumen de decisiones
 
@@ -104,7 +104,7 @@ El router no ve lo que vLLM expulsa de su caché. Si el árbol solo creciera, ac
 
 **Decisión:** cada worker tiene en el árbol una **capacidad en bloques**, por defecto `TokenBudget / 16` (toda su KV-Cache, que es lo que vLLM puede mantener cacheado cuando está ociosa). Cuando un `Insert` la supera, se expulsan del árbol las **hojas** de ese worker menos usadas, hasta 7/8 de la capacidad (el margen hace que la expulsión no ocurra en cada inserción).
 
-**Por qué funciona:** con una sola réplica del control plane (FI-2), el router ve **todo** el tráfico que llega a cada worker. Su LRU recibe la misma secuencia de usos que la del worker, así que expulsa más o menos lo mismo. La medición lo confirma: el router predijo un 73,8 % de aciertos y la caché real tuvo un 74,5 % ([Mediciones](#mediciones)).
+**Por qué funciona:** con una sola réplica del control plane (FI-2), el router ve **todo** el tráfico que llega a cada worker. Su LRU recibe la misma secuencia de usos que la del worker, así que expulsa más o menos lo mismo. La medición lo confirma: el router predijo un 73,8 % de aciertos y la caché real tuvo un 74,5 % ([Mediciones](../operaciones/04-resultados-de-pruebas.md#fase-3-router-por-prefijos-frente-a-round-robin-simulador)).
 
 **Dónde diverge** (y por qué no importa demasiado: un error solo cuesta un prefill, nunca corrección):
 
@@ -138,7 +138,7 @@ La afinidad pura envía todo el tráfico de un prefijo popular al mismo worker y
 
 **`MinMatchBlocks`:** un acierto de 1–3 bloques (16–48 tokens) ahorra un prefill despreciable. Sin este mínimo, un saludo común (`user: Hola, ...`) desequilibraría el reparto sin ganar nada.
 
-**Por qué no esperar al worker afín:** si el worker afín está lleno, la petición va a otro que tenga sitio, aunque haya que hacer el prefill entero. Esperar a un worker concreto sería una reserva por worker, que la Fase 2 descartó al separar cola y colocación ([08 · C1](08-fase-2-decisiones.md#conflictos-resueltos)). Un prefill completo cuesta decenas o cientos de ms; esperar en la cola puede costar segundos.
+**Por qué no esperar al worker afín:** si el worker afín está lleno, la petición va a otro que tenga sitio, aunque haya que hacer el prefill entero. Esperar a un worker concreto sería una reserva por worker, que la Fase 2 descartó al separar cola y colocación ([09 · C1](09-fase-2-decisiones.md#conflictos-resueltos)). Un prefill completo cuesta decenas o cientos de ms; esperar en la cola puede costar segundos.
 
 ## Decisión 6: el prefijo se registra al conceder el lease
 
@@ -205,30 +205,7 @@ En código, `scheduler.Config.Placement` sigue siendo `&RoundRobin{}` por defect
 
 ## Mediciones
 
-Con `-prefill-per-token 100us` (~10.000 tokens/s de prefill, más cerca de un modelo 8B real que los 20 µs por defecto), 3 workers con el presupuesto por defecto (16.384 tokens, caché de 1.024 bloques cada uno), 4 req/s durante 60 s, sin RAG ni cancelaciones, y la misma semilla en ambos modos:
-
-```bash
-task run -- -placement prefix -prefill-per-token 100us        # o -placement round-robin
-task loadgen -- -rate 4 -duration 60s -prefixes 24 -rag-fraction 0 -cancel-fraction 0
-```
-
-| Escenario | Colocación | TTFT p50 | TTFT p99 | Acierto real | Acierto previsto | Reparto de leases |
-| :--- | :--- | ---: | ---: | ---: | ---: | :--- |
-| 24 *system prompts* de ~1.500 tokens, uniformes | **prefix** | **57 ms** | 210 ms | **74,5 %** | 73,8 % | 82 / 79 / 74 |
-| | round-robin | 206 ms | 214 ms | 39,8 % | — | 79 / 78 / 78 |
-| 24 prompts, Zipf `-prefix-skew 1.5` (unos pocos calientes) | **prefix** | 56 ms | 207 ms | **85,9 %** | 85,4 % | 72 / 50 / 89 |
-| | round-robin | 57 ms | 208 ms | 75,8 % | — | 71 / 70 / 70 |
-| 1 único prompt para todo el tráfico | **prefix** | 56 ms | 73 ms | 95,7 % | — | 88 / 83 / 64 |
-| | round-robin | 56 ms | 78 ms | 95,7 % | — | 79 / 78 / 78 |
-
-Lectura:
-
-- **Uniforme:** el caso para el que existe el router. Los 24 prompts ocupan ~2.250 bloques, más que la caché de un worker (1.024) pero menos que la de los tres. Con round-robin cada worker intenta guardarlos todos y se expulsan entre sí. Con afinidad se reparten y caben, así que el TTFT p50 baja de 206 ms a 57 ms (el prefill de 1.500 tokens desaparece). El p99 sigue en ~210 ms porque cada prompt hace un prefill completo la primera vez en cada worker, y 22 peticiones desbordaron por carga.
-- **Zipf:** los prompts calientes caben en todas las cachés, así que round-robin también acierta en la mediana. La afinidad mejora el acierto global (+10 puntos) a costa de un reparto menos uniforme (50–89), que el umbral de carga mantiene acotado.
-- **Un solo prompt (el caso de FI-6):** sin el umbral, los 235 leases habrían ido a un worker. Con él, 2 desbordamientos replicaron el prompt en los 3 workers y desde entonces el empate se resolvió por carga. Acierto y latencia son iguales que con round-robin: la afinidad no empeora el caso que más temía FI-6.
-- El acierto previsto por el árbol queda a menos de 1 punto del real en los dos casos con expulsiones. Aproximar la caché con una LRU propia funciona mientras haya una sola réplica.
-
-A 20 req/s (unas 4× la capacidad del pool con reserva pesimista) ambos modos saturan y el TTFT lo domina la cola (~5 s). La afinidad no añade capacidad (ver FI-1 arriba).
+Con 24 *system prompts* compartidos, el router por prefijos baja el TTFT p50 de 206 a 57 ms y sube el acierto de caché del 40 % al 75 % frente a round-robin; con un único prompt muy popular, el umbral de carga lo replica en los 3 workers sin empeorar nada. El árbol predice el acierto real a menos de un punto. Montaje, tablas y lectura en [resultados](../operaciones/04-resultados-de-pruebas.md#fase-3-router-por-prefijos-frente-a-round-robin-simulador).
 
 ## Limitaciones y trabajo futuro
 
@@ -237,3 +214,18 @@ A 20 req/s (unas 4× la capacidad del pool con reserva pesimista) ambos modos sa
 - **Sin eventos del motor.** El árbol no recibe confirmación de lo que hay realmente en cada GPU. Si la versión de vLLM que se fije publica eventos agrupados de KV-Cache, podrán corregir el árbol fuera del camino crítico ([06](06-relacion-con-vllm.md#el-vllmadapter-fase-6a)).
 - **Varias réplicas (FI-2):** cada réplica tendría su propio árbol y vería solo parte del tráfico, así que su LRU dejaría de imitar la del worker. El particionado por worker de FI-2 lo resolvería: cada worker pertenece a una sola réplica.
 - **`RemoveWorker`** no está conectado a nada todavía: no hay registro de workers hasta la Fase 4.
+
+---
+
+## Qué pasó después
+
+Este documento es el registro de la fase tal como se decidió; lo que anunciaba para fases posteriores se resolvió así (estado al cerrar el proyecto, 2026-11-21):
+
+| Lo que quedó dicho aquí | Qué pasó |
+| :--- | :--- |
+| `RemoveWorker` no estaba conectado a nada (limitaciones). | Conectado en la Fase 4: la baja con drenaje olvida al worker en el árbol al terminar su último stream, y un reinicio detectado (`InstanceID` nuevo) borra sus prefijos ([11](11-fase-4-decisiones.md)). |
+| Los hashes no son los de vLLM: había que comprobar la *chat template* real (limitaciones). | Con vLLM real en CPU (Qwen2.5-0.5B), el acierto previsto por el árbol fue del 75,7 % y el real del 75,0 % ([14](14-fase-6b-cpu-decisiones.md)): la plantilla no rompió los prefijos compartidos. Apareció otra diferencia: en CPU el bloque del motor es de 128 tokens y el router piensa en 16; se aceptó como limitación porque no afectó a la predicción. |
+| Descontar los prefijos en caché del coste se revisaría con la ocupación real de vLLM en la Fase 6 (interacción con FI-1). | **Medido, no cambiado:** con vLLM en CPU, el ledger reservó de media ~3 veces lo que vLLM ocupaba, sobre todo por cobrar el prompt entero aunque estuviera en caché. Es el bloque de trabajo pendiente más importante (FI-1). |
+| Sin eventos del motor para corregir el árbol (limitaciones). | No se usaron: el árbol con su propia LRU predijo bien la caché real. |
+| El router frente a round-robin, medido en el simulador. | Repetido con vLLM real en CPU: acierto real del 53 % al 75 % y TTFT p50 de 24 s a 4,7 s (×5). La dirección del efecto se confirmó; el tamaño depende del coste del prefill ([resultados](../operaciones/04-resultados-de-pruebas.md#fase-6b-cpu-benchmark-con-vllm-real-en-cpu)). |
+| Varias réplicas tendrían cada una su árbol (FI-2). | Sigue igual: una réplica, ahora explícita en el despliegue con `Recreate` (Fase 7). |

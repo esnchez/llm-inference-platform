@@ -2,7 +2,7 @@
 
 Este documento recoge las decisiones de la Fase 6b-CPU: llevar la plataforma de un vLLM falso a **vLLM real ejecutándose en CPU**, corregir lo que eso ha destapado y hacer las mediciones que el roadmap reservaba para GPUs, en versión **relativa**. Como en las fases anteriores, es el registro del *por qué*, con alternativas y la opción recomendada.
 
-> **Estado (2026-11-21): implementada, con un criterio explícito: un sistema funcional y sencillo, no perfecto.** De las once decisiones se aplicaron las que aportan funcionamiento real con poco código; las demás se dejan como limitaciones documentadas. Ver [Qué sí y qué no](#qué-sí-y-qué-no) y los [resultados](#resultados-del-benchmark-y-de-las-mediciones).
+> **Estado (2026-11-21): implementada, con un criterio explícito: un sistema funcional y sencillo, no perfecto.** De las once decisiones se aplicaron las que aportan funcionamiento real con poco código; las demás se dejan como limitaciones documentadas. Ver [Qué sí y qué no](#qué-sí-y-qué-no) y los [resultados](../operaciones/04-resultados-de-pruebas.md#fase-6b-cpu-benchmark-con-vllm-real-en-cpu).
 
 ## Por qué una 6b en CPU
 
@@ -151,7 +151,7 @@ Con 8 CPUs y ~15,8 GB, caben **dos instancias** como mucho (cada una ~3 hilos y 
 
 ## Decisión 9: mediciones relativas
 
-**Recomendación:** un protocolo fijo por cada pregunta abierta, ejecutado con el stack de la decisión 8 y `loadgen`, con los resultados en este documento:
+**Recomendación:** un protocolo fijo por cada pregunta abierta, ejecutado con el stack de la decisión 8 y `loadgen`, con los resultados en [operaciones · resultados](../operaciones/04-resultados-de-pruebas.md#fase-6b-cpu-benchmark-con-vllm-real-en-cpu):
 
 | Pregunta | Cómo se mide | Qué se espera aprender |
 | :--- | :--- | :--- |
@@ -190,7 +190,7 @@ Con 8 CPUs y ~15,8 GB, caben **dos instancias** como mucho (cada una ~3 hilos y 
 2. **Correcciones de comportamiento:** recorte de `max_tokens` (2), redondeo al bloque del motor (3), corrección en línea de la estimación (4), flag del timeout por token (5), log (6). Con tests contra el simulador y el falso.
 3. **Stack con vLLM en CPU** (8) y validación con la prueba de humo.
 4. **Mediciones y benchmark** (9 y 10): ejecutarlos y documentar los resultados.
-5. **Documentación:** documentos 1–7, 12, este documento con los resultados, y el README (roadmap 6b → 6b-CPU, FI-1, FI-3, FI-4, FI-6).
+5. **Documentación:** documentos 1–7, la guía de observabilidad, este documento con los resultados, y el README (roadmap 6b → 6b-CPU, FI-1, FI-3, FI-4, FI-6).
 
 **Tiempo de máquina esperado:** el paso 4 es el lento. Son dos arranques de vLLM (~9 min la primera vez) y unos 50 minutos de benchmark, más las mediciones. Se puede dejar ejecutándose en segundo plano.
 
@@ -205,7 +205,7 @@ Criterio (indicado al aprobar): **probar un sistema funcional, no perfecto; pref
 | 1 | Versión fijada y capturas reales | **Sí, ligera** | `v0.34.0` fijada; respuestas reales en `internal/vllm/testdata/vllm-0.34.0/` usadas por los tests del parser SSE, de `/metrics`, de errores y del descubrimiento. El vLLM falso **no** se reajustó a las capturas. |
 | 2 | Recortar `max_tokens` como vLLM | **Sí** | Pocas líneas y quita una incompatibilidad real (rechazábamos peticiones válidas para vLLM). |
 | 3 | Redondear el acierto al bloque del motor (128) | **No** | Tocaba el contrato y la colocación. Limitación: el router puede contar hasta 127 tokens de acierto que vLLM no reutiliza. El benchmark mostró que el acierto previsto y el real coinciden igualmente (75,7 % frente a 75,0 %). |
-| 4 | Corrección en línea de la estimación de tokens | **No** | Era la pieza más compleja. Con el recorte de la decisión 2, el error no rompe nada: si nos quedamos cortos, vLLM recorta o devuelve `400` (bien clasificado). En prompts largos el error medido es pequeño (ver resultados). |
+| 4 | Corrección en línea de la estimación de tokens | **No** | Era la pieza más compleja. Con el recorte de la decisión 2, el error no rompe nada: si nos quedamos cortos, vLLM recorta o devuelve `400` (bien clasificado). En prompts largos el error medido es pequeño (ver [resultados](../operaciones/04-resultados-de-pruebas.md#fi-3-estimación-de-tokens)). |
 | 5 | Flag del timeout por token y perfil de CPU | **Sí** | Sin él, en CPU los prefills lentos se tratan como cuelgues. |
 | 6 | Log de `completion_tokens` y nota sobre `abort` | **Sí** | Trivial. |
 | 7 | Prueba de humo con `VLLM_URL` | **Sí** | `TestRealVLLM` y `task vllm-cpu:up/down/smoke`; vuelve repetible la verificación. |
@@ -230,54 +230,7 @@ Por el camino, un test destapó que la API informaba en las métricas la reserva
 
 ## Resultados del benchmark y de las mediciones
 
-**Montaje:** dos instancias de vLLM 0.34 en CPU (i5-9400H, AVX2), cada una con 3 hilos en núcleos distintos y una KV-Cache de 192 MiB (8 192 tokens, 64 bloques de 128, descubiertos por el adaptador). `loadgen`: 8 *system prompts* de 6 000 caracteres (~1 450–1 600 tokens reales por petición), `max_tokens` 16, 0,1 peticiones/s, 20 minutos por modo, misma semilla, prompts nuevos en cada modo (`-prefix-namespace`). Perfil de CPU: `-ttft-timeout 30s -ttft-timeout-per-token 25ms -stall-timeout 30s`.
-
-```bash
-VLLM_KV_BYTES=201326592 task stack:up:vllm-cpu:2
-task loadgen -- -model Qwen/Qwen2.5-0.5B-Instruct -rate 0.1 -duration 20m -prefixes 8 -system-chars 6000 \
-  -chat-max-tokens 16 -rag-fraction 0 -cancel-fraction 0 -prefix-namespace A -seed 7
-# después, con PLACEMENT=round-robin (solo se reinicia la plataforma) y -prefix-namespace B
-```
-
-### Router por prefijos frente a round-robin
-
-| | Afinidad de prefijo | Round-robin |
-| :--- | ---: | ---: |
-| Peticiones enviadas | 124 | 124 |
-| `200` | **96 (77,4 %)** | 88 (71,0 %) |
-| `503` (`worker_unavailable` + `no_healthy_workers` + `queue_timeout`) | 28 | 36 |
-| **TTFT del cliente, p50** | **4,7 s** | 24,0 s |
-| TTFT del worker (prefill), p50 | 4,7 s | 23,3 s |
-| TTFT p90 (ambos) | > 40 s (último *bucket*) | > 40 s |
-| **Acierto real de la caché de vLLM** | **75,0 %** | 53,4 % |
-| Acierto previsto por el router | 75,7 % | — |
-| Fallos atribuidos a workers (cuelgues por timeout) | 24 (18) | 50 (26) |
-| Aperturas del breaker | 3 | 7 |
-
-**Lectura:**
-
-- **El router funciona con un motor real.** Con los 8 prompts repartidos entre dos instancias que solo caben a medias en cada una, la afinidad sube el acierto real de la caché del 53 % al 75 % y **baja el TTFT mediano unas 5×** (4,7 s frente a 24 s). El efecto va en la misma dirección que en el simulador (Fase 3: ×3,6) y es mayor porque en CPU el prefill es mucho más caro.
-- **FI-6 en real:** el acierto previsto por el árbol (75,7 %) quedó a menos de un punto del real (75,0 %), con expulsiones reales y bloques de 128. La LRU del árbol imita bien la caché de vLLM.
-- **Las cifras absolutas no significan nada fuera de esta máquina** (0,5B parámetros, CPU de portátil). Lo que vale es la comparación.
-
-### FI-1: reserva del ledger frente a KV-Cache real
-
-| | Afinidad | Round-robin |
-| :--- | ---: | ---: |
-| Reserva del ledger, media | 29,5 % | 42,9 % |
-| **KV-Cache real (`vllm:kv_cache_usage_perc`), media** | **9,6 %** | **13,4 %** |
-| Reserva del ledger, máximo | 95,9 % | 95,9 % |
-| KV-Cache real, máximo | 63,5 % | 82,5 % |
-
-El ledger reserva **unas 3 veces más** de lo que vLLM ocupa de media. En este tráfico, la causa principal no es `max_tokens` (solo 16) sino que la reserva cobra el prompt completo a cada petición aunque esté en caché (FI-1, segundo problema). Con `max_tokens` grandes, la diferencia sería mayor. Es el dato que FI-1 pedía; cambiar la reserva queda para una fase propia.
-
-### FI-3: estimación de tokens
-
-| | p10 | p50 | p90 |
-| :--- | ---: | ---: | ---: |
-| Estimados / reales (prompts de ~1 500 tokens) | 0,91 | 0,95 | 0,99 |
-
-Con prompts largos, la estimación de "4 caracteres por token" se queda solo un 5 % corta (mediana). El caso malo son los prompts **cortos**: la *chat template* añade ~28 tokens fijos (en la verificación, "Di hola": estimados 4, reales 32). Como se rechazó la corrección (decisión 4), queda como limitación: afecta poco a la reserva (son pocos tokens) y vLLM recorta o rechaza si hace falta.
+Con dos instancias de vLLM real en CPU, el router por prefijos sube el acierto real de caché del 53 % al 75 % y baja el TTFT mediano unas 5× (de 24 s a 4,7 s); el árbol predice el acierto real a menos de un punto (FI-6). El ledger reserva ~3 veces lo que vLLM ocupa (FI-1) y la estimación de tokens se queda un 5 % corta en prompts largos (FI-3). Montaje, tablas y lectura en [resultados](../operaciones/04-resultados-de-pruebas.md#fase-6b-cpu-benchmark-con-vllm-real-en-cpu).
 
 ## Limitaciones conocidas (aceptadas)
 
@@ -291,3 +244,15 @@ Con prompts largos, la estimación de "4 caracteres por token" se queda solo un 
 | El vLLM falso no se reajustó a las capturas (bloque de 16, no recorta `max_tokens`). | Sus magnitudes no son las reales (ya lo eran antes). | Reajustarlo si se vuelve a usar para medir. |
 | vLLM 0.34 no cuenta las desconexiones en `request_success_total{finished_reason="abort"}`. | Ese contador no sirve para comprobar cancelaciones. | La prueba de humo usa `num_requests_running`. |
 | Arranque de ~6 minutos por instancia (más la primera vez) y ~4 tokens/s. | Probar cuesta tiempo de reloj. | Ninguna en CPU. |
+
+---
+
+## Qué pasó después
+
+Este documento es el registro de la fase tal como se decidió; lo que anunciaba para fases posteriores se resolvió así (estado al cerrar el proyecto, 2026-11-21):
+
+| Lo que quedó dicho aquí | Qué pasó |
+| :--- | :--- |
+| La Fase 7 pierde el punto de "pesos compartidos" (decisión 11). | Así fue: el chart de la Fase 7 usa un PVC para la caché del modelo de vLLM en CPU (desactivado por defecto). |
+| Mitigación de la concurrencia limitada por memoria y no por cálculo: bajar `-vllm-token-budget` (no probada). | Sigue sin probar; documentada como limitación en el [análisis final](../analisis-final.md#limitaciones-conocidas). |
+| Autoscaling del vLLM en CPU. | Fuera de la Fase 7: ~6 minutos de arranque lo hacen inútil. KEDA escala los vLLM falsos. |

@@ -1,8 +1,8 @@
-# 12. Observabilidad
+# 3. Observabilidad
 
-Esta guía explica **qué mide la plataforma, por qué esas métricas y no otras, cómo leer los dashboards y cómo diagnosticar problemas** con ellos y con los logs. Las decisiones de diseño detrás (librería, arquitectura, alcance) están en [11 · Fase 5: decisiones](11-fase-5-decisiones.md).
+Esta guía explica **qué mide la plataforma, por qué esas métricas y no otras, cómo leer los dashboards y cómo diagnosticar problemas** con ellos y con los logs. Las decisiones de diseño detrás (librería, arquitectura, alcance) están en [12 · Fase 5: decisiones](../servicio/12-fase-5-decisiones.md).
 
-> **Estado (2026-11-18): implementado.** Las métricas, los logs, el stack y el dashboard de esta guía existen y se validaron contra el stack local con `loadgen` (prefijos compartidos, un worker caído, uno colgado y un reinicio): cada consulta del dashboard se ejecutó contra Prometheus y el dashboard se revisó visualmente. Código: `internal/metrics`, `deploy/observability`. Decisiones: [11](11-fase-5-decisiones.md).
+> **Estado (2026-11-18): implementado.** Las métricas, los logs, el stack y el dashboard de esta guía existen y se validaron contra el stack local con `loadgen` (prefijos compartidos, un worker caído, uno colgado y un reinicio): cada consulta del dashboard se ejecutó contra Prometheus y el dashboard se revisó visualmente. Código: `internal/metrics`, `deploy/observability`. Decisiones: [12](../servicio/12-fase-5-decisiones.md). Desde entonces, el dashboard ganó la fila del motor (Fase 6a), se usó con vLLM real en CPU (6b-CPU) y se despliega igual en Kubernetes con el chart de Helm (Fase 7).
 
 ## Índice
 
@@ -37,25 +37,7 @@ El orden importa. El dashboard está ordenado igual: se mira de arriba abajo y c
 
 ## Arrancar el stack
 
-```bash
-task stack:up                     # construye la imagen y arranca plataforma + Prometheus + Grafana (necesita Docker)
-task loadgen -- -rate 4 -duration 2m -prefixes 24 -rag-fraction 0      # tráfico con prefijos compartidos
-task loadgen -- -rate 5 -duration 100s -prefixes 24 -chaos hang        # o con un worker que se cuelga a mitad
-task stack:up:fake-vllm           # variante (Fase 6a): la plataforma habla por HTTP con 3 vLLM falsos (:8001-8003)
-task stack:up:vllm-cpu            # variante (Fase 6b-CPU): vLLM real en CPU (~6 min de calentamiento); :2 para dos instancias
-task loadgen -- -rate 5 -duration 90s -prefixes 24 -chaos hang -chaos-worker http://localhost:8001   # caos sobre un vLLM falso
-task stack:logs                   # logs JSON de la plataforma
-task stack:down                   # para y borra el stack (no guarda datos)
-```
-
-Ficheros (`deploy/observability/`): `docker-compose.yml`, `prometheus/prometheus.yml` (*scrape* cada 5 s, retención 2 días), `prometheus/alerts.yml` (las [alertas de ejemplo](#sli-slo-y-alertas-propuestas)), `grafana/provisioning/` (fuente de datos y proveedor de dashboards) y `grafana/dashboards/llm-platform-overview.json` (el dashboard). La plataforma corre en el contenedor con `-prefill-per-token 100us`, para que el efecto de la caché de prefijos se vea en el TTFT.
-
-| Servicio | URL | Para qué |
-| :--- | :--- | :--- |
-| Plataforma | `http://localhost:8080` | API, `/metrics`, `/debug/*` (en Kubernetes, `/metrics` y `/debug/*` van al puerto de administración: `localhost:18081` con `task k8s:port-forward`, [16](16-fase-7-decisiones.md)) |
-| Prometheus | `http://localhost:9090` | Consultas PromQL sueltas, estado del *scrape* (`/targets`) |
-| Grafana | `http://localhost:3000` | Dashboard **LLM Platform · Overview**, página de inicio (acceso anónimo de solo lectura; `admin`/`admin` para editar) |
-| Alertas | `http://localhost:9090/alerts` | Estado de las reglas de ejemplo (sin Alertmanager: no avisan a nadie) |
+Cómo levantar el stack (y sus variantes con vLLM falso, vLLM en CPU o Kubernetes), sus URLs y sus ficheros: [entorno local](01-entorno-local.md#stack-de-observabilidad-docker).
 
 **El dashboard es código.** Grafana lo carga del JSON del repositorio y no admite guardar cambios desde la UI (`allowUiUpdates: false`). Para cambiarlo: editar en la UI como `admin`, exportar el JSON (*Share → Export*) y sustituir el fichero.
 
@@ -239,7 +221,7 @@ Con un motor real, `prompt_tokens_total` y `generation_tokens_total` llevan sus 
 
 ### *Buckets* de los histogramas
 
-Alineados con los de vLLM en el rango útil, para poder comparar percentiles en la Fase 6 (comprobar con la versión de vLLM que se fije, como en FI-4):
+Alineados con los de vLLM en el rango útil, para poder comparar percentiles entre el control plane y el motor. Con vLLM en CPU (6b-CPU), el TTFT p90 superó el último *bucket* (40 s): el histograma no distingue entre 40 s y 90 s. Se aceptó, porque en GPU ese rango no hace falta:
 
 | Histograma | *Buckets* (segundos) |
 | :--- | :--- |
@@ -286,7 +268,7 @@ sum by (worker) (increase(llmplatform_worker_restarts_detected_total[1m])) > 0
 | Panel | Consulta | Cómo leerlo |
 | :--- | :--- | :--- |
 | **Saturación por worker** (%, una línea por worker) | `llmplatform_worker_tokens_reserved{worker=~"$worker"} / llmplatform_worker_token_budget` | Ocupación del ledger. Workers parejos = buen reparto. Uno siempre más alto = prefijo caliente o worker preferido por afinidad. **Cuidado:** el 100 % es del ledger pesimista; la GPU real puede estar mucho más vacía (FI-1). |
-| **Saturación del pool** | `sum(llmplatform_worker_tokens_reserved) / sum(llmplatform_worker_token_budget)` | La señal que usaría el autoscaler (Fase 7), corregida por la eficiencia de la reserva. |
+| **Saturación del pool** | `sum(llmplatform_worker_tokens_reserved) / sum(llmplatform_worker_token_budget)` | La capacidad comprometida del pool. El autoscaling de la Fase 7 (KEDA) no escala por esta saturación, que satura al 100 % y deja de crecer, sino por la **demanda en tokens**: `sum(llmplatform_worker_tokens_reserved) + sum(llmplatform_queue_tokens)`, lo reservado más lo que espera en cola ([15 · Decisión 5](../servicio/15-fase-7-decisiones.md#decisión-5-autoscaling-con-keda)). |
 | **Eficiencia de la reserva** | `(sum(rate(llmplatform_prompt_tokens_total[5m])) + sum(rate(llmplatform_generation_tokens_total[5m]))) / sum(rate(llmplatform_reserved_tokens_total[5m]))` | Qué fracción de lo reservado se usa de verdad. Con `max_tokens` grandes y salidas cortas puede bajar del 30 %: es el coste de FI-1, medido. |
 | **Leases activos por worker** | `llmplatform_worker_leases_active{worker=~"$worker"}` | Concurrencia por worker; explica sus diferencias de ITL. |
 
@@ -399,7 +381,7 @@ Uno por petición, al terminar:
 
 ## SLI, SLO y alertas propuestas
 
-Propuesta para fijar criterio; los objetivos son orientativos y se calibrarán con vLLM. Las reglas de abajo están en `deploy/observability/prometheus/alerts.yml`: Prometheus las evalúa y muestra su estado en `http://localhost:9090/alerts`, pero no hay Alertmanager, así que no avisan a nadie (ver [11 · Decisión 8](11-fase-5-decisiones.md#decisión-8-alcance)). En la prueba del ejemplo de arriba, `ServerErrorsHigh` y `SustainedLoadShedding` pasaron a `pending`, como debían.
+Propuesta para fijar criterio; los objetivos son orientativos y se calibrarán con vLLM. Las reglas de abajo están en `deploy/observability/prometheus/alerts.yml`: Prometheus las evalúa y muestra su estado en `http://localhost:9090/alerts`, pero no hay Alertmanager, así que no avisan a nadie (ver [12 · Decisión 8](../servicio/12-fase-5-decisiones.md#decisión-8-alcance)). En la prueba del ejemplo de arriba, `ServerErrorsHigh` y `SustainedLoadShedding` pasaron a `pending`, como debían.
 
 | SLI | Definición | Objetivo propuesto |
 | :--- | :--- | :--- |
@@ -441,7 +423,7 @@ groups:
 
 ## Relación con las métricas de vLLM (Fase 6)
 
-Con vLLM, Prometheus hará *scrape* también del `/metrics` de cada servidor vLLM. Las métricas del control plane y las del motor se complementan: las nuestras ven el clúster y lo que percibe el cliente; las de vLLM ven el interior de cada GPU. Los nombres de vLLM cambian entre versiones (FI-4) y hay que comprobarlos con la versión fijada.
+Con vLLM, Prometheus lee también el `/metrics` de cada servidor (`job="vllm"`): con direcciones fijas en los stacks de Docker y por el DNS del Service *headless* en Kubernetes. Las métricas del control plane y las del motor se complementan: las nuestras ven el clúster y lo que percibe el cliente; las de vLLM ven el interior de cada GPU. Los nombres de vLLM cambian entre versiones (FI-4); los de esta tabla están comprobados contra la versión fijada, la 0.34.
 
 | Plataforma (`llmplatform_…`) | vLLM (`vllm:…`) | Diferencia |
 | :--- | :--- | :--- |
@@ -454,11 +436,11 @@ Con vLLM, Prometheus hará *scrape* también del `/metrics` de cada servidor vLL
 | `worker_prefix_cache_hit_blocks_total / …queried…` | `prefix_cache_hits` / `prefix_cache_queries` (en tokens) | Acierto real de la caché; vLLM cuenta tokens, nosotros bloques de 16. |
 | — | `num_preemptions` | Expulsiones por falta de memoria: con la reserva pesimista deberían ser ~0; si se relaja (FI-1), es la métrica que vigilar. |
 
-Desde la Fase 6a, el dashboard tiene una fila **6 · Motor (vLLM)** con la comparación clave (*KV-Cache real frente a reserva del ledger*), la cola propia del motor y el error de estimación de tokens. Con el stack `task stack:up:fake-vllm`, Prometheus lee también el `/metrics` de los motores (`job="vllm"`), como hará con vLLM real: las métricas `vllm:*` se pueden consultar directamente. **Con el vLLM falso las magnitudes son inventadas** ([13](13-fase-6a-decisiones.md#lo-que-el-falso-no-puede-decir-pendiente-de-la-6b)): la fila sirve para comprobar el camino de los datos, no para sacar conclusiones.
+Desde la Fase 6a, el dashboard tiene una fila **6 · Motor (vLLM)** con la comparación clave (*KV-Cache real frente a reserva del ledger*), la cola propia del motor y el error de estimación de tokens. Con `task stack:up:fake-vllm` o `task stack:up:vllm-cpu`, las métricas `vllm:*` se pueden consultar directamente. Con vLLM real en CPU, esta fila dio la medición de FI-1: el ledger reservó de media ~3 veces la KV-Cache que vLLM ocupaba ([resultados](04-resultados-de-pruebas.md#fi-1-reserva-del-ledger-frente-a-kv-cache-real)). **Con el vLLM falso las magnitudes son inventadas** ([13](../servicio/13-fase-6a-decisiones.md#lo-que-el-falso-no-puede-decir-pendiente-de-la-6b)): la fila sirve para comprobar el camino de los datos, no para sacar conclusiones.
 
 ## Limitaciones
 
-- **Los valores son simulados.** TTFT, ITL y acierto de caché vienen de `simworker`: las formas y las relaciones entre métricas son las reales, pero las magnitudes se calibrarán con vLLM.
+- **Los valores dependen del entorno.** Con `simworker` y con el vLLM falso, las formas y las relaciones entre métricas son las reales, pero las magnitudes son inventadas. Con vLLM en CPU son reales pero no trasladables a GPU. Los umbrales de las alertas y los *buckets* no se han calibrado con GPUs.
 - **La saturación es la del ledger**, no la de la GPU (FI-1). La fila 3 muestra la eficiencia de la reserva para no olvidarlo.
 - **Los percentiles son aproximados** (interpolación dentro del *bucket*). Para comparar dos configuraciones con precisión, `loadgen` sigue dando percentiles exactos del lado del cliente.
 - **Resolución de 5 s.** Un pico más corto que el intervalo de *scrape* se ve atenuado en `rate()`.

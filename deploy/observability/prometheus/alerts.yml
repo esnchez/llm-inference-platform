@@ -1,4 +1,4 @@
-# Example alerts (docs/servicio/12-observabilidad.md, "SLI, SLO y alertas").
+# Example alerts (docs/operaciones/03-observabilidad.md, "SLI, SLO y alertas").
 # Evaluated by Prometheus and visible at /alerts; no Alertmanager, so nobody
 # is notified. Thresholds are a starting point, to calibrate with vLLM.
 groups:

@@ -1,6 +1,6 @@
 # Distributed LLM Inference Platform
 
-> **Estado:** Fases 1 a 5, 6a y 6b-CPU implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados; adaptador vLLM verificado contra vLLM 0.34 real en CPU; el proyecto no se prueba en GPUs). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md), [Fase 5](docs/servicio/11-fase-5-decisiones.md), [Fase 6a](docs/servicio/13-fase-6a-decisiones.md), [Fase 6b-CPU](docs/servicio/14-fase-6b-cpu-decisiones.md). **Observabilidad:** [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md). **Análisis final** (razonamientos, evidencias, limitaciones y distancia a producción): [`docs/servicio/15-analisis-final.md`](docs/servicio/15-analisis-final.md).  
+> **Estado:** Fases 1 a 7 implementadas, con la 6b en CPU (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados; adaptador vLLM verificado contra vLLM 0.34 real en CPU; despliegue en Kubernetes local con Helm y autoscaling con KEDA; el proyecto no se prueba en GPUs). Decisiones: [Fase 1](docs/servicio/08-fase-1-decisiones.md), [Fase 2](docs/servicio/09-fase-2-decisiones.md), [Fase 3](docs/servicio/10-fase-3-decisiones.md), [Fase 4](docs/servicio/11-fase-4-decisiones.md), [Fase 5](docs/servicio/12-fase-5-decisiones.md), [Fase 6a](docs/servicio/13-fase-6a-decisiones.md), [Fase 6b-CPU](docs/servicio/14-fase-6b-cpu-decisiones.md), [Fase 7](docs/servicio/15-fase-7-decisiones.md). Mapa de la documentación: [`docs/`](docs/README.md) (servicio, operaciones y análisis final). **Observabilidad:** [`docs/operaciones/03-observabilidad.md`](docs/operaciones/03-observabilidad.md). **Análisis final** (razonamientos, evidencias, limitaciones y distancia a producción): [`docs/analisis-final.md`](docs/analisis-final.md).  
 > **Documentación de la implementación:** [`docs/servicio/`](docs/servicio/README.md) (componentes, recorrido de una petición, leases, relación con vLLM).  
 > **Objetivo:** Construir una plataforma de serving de LLM distribuida a nivel de producción, con routing consciente de KV-Cache (Prefix-aware), scheduling basado en capacidad de tokens (VRAM), control de concurrencia atómico mediante *leases*, y autoscaling predictivo para K8s/vLLM.
 
@@ -33,10 +33,10 @@ Durante la fase de diseño se identificaron varios cuellos de botella clásicos 
 | **Contrato de Inferencia** | Petición/Respuesta unaria y bloqueante (`Infer`). | **Streaming-First** (`InferStream`). | El 95% del tráfico LLM es streaming. Empezar con streaming evita reescribir todo el manejo de red, buffers y cancelaciones más adelante. |
 | **Control de Admisión** | Snapshot de capacidad -> Selección (Condición de carrera). | **Leases Atómicos** (`AcquireLease`). | Evita que dos peticiones reclamen la misma capacidad simultáneamente. Un *lease* garantiza los recursos antes de iniciar el streaming. |
 | **Unidad de Capacidad** | Peticiones en vuelo (`in_flight / max_concurrency`). | **Presupuesto de Tokens / VRAM**. | Las peticiones LLM tienen costes asimétricos. Un prompt de 8K tokens satura la VRAM mucho antes que 10 prompts de 100 tokens. |
-| **Algoritmo de Routing** | *Least-loaded* (Menor carga de conexiones). | **Prefix-Aware / Affinity Routing**. | *Least-loaded* destruye la localidad del KV-Cache. Medido en este proyecto, frente a round-robin: TTFT p50 ×3,6 peor en el simulador ([Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md#mediciones)) y ×5 con vLLM real en CPU ([Fase 6b-CPU](docs/servicio/14-fase-6b-cpu-decisiones.md#resultados-del-benchmark-y-de-las-mediciones)). Usamos un Radix Tree para enviar peticiones al nodo que ya tiene ese contexto procesado. |
-| **Autoscaling (Futuro)** | Basado en utilización de CPU o tráfico HTTP (HPA). | **Basado en Saturación de Cache**. | En LLMs, la GPU puede estar al 100% de cómputo con 1 request o con 64. Escalaremos leyendo `vllm:gpu_cache_usage_factor` y `vllm:num_requests_waiting` (nombre de métrica pendiente de corregir, ver [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm)). |
+| **Algoritmo de Routing** | *Least-loaded* (Menor carga de conexiones). | **Prefix-Aware / Affinity Routing**. | *Least-loaded* destruye la localidad del KV-Cache. Medido en este proyecto, frente a round-robin: TTFT p50 ×3,6 peor en el simulador ([Fase 3](docs/operaciones/04-resultados-de-pruebas.md#fase-3-router-por-prefijos-frente-a-round-robin-simulador)) y ×5 con vLLM real en CPU ([Fase 6b-CPU](docs/operaciones/04-resultados-de-pruebas.md#fase-6b-cpu-benchmark-con-vllm-real-en-cpu)). Usamos un Radix Tree para enviar peticiones al nodo que ya tiene ese contexto procesado. |
+| **Autoscaling** | Basado en utilización de CPU o tráfico HTTP (HPA). | **Basado en la demanda en tokens** que ve la plataforma (reservado + en cola), con KEDA. | En LLMs, la GPU puede estar al 100% de cómputo con 1 request o con 64: la CPU no dice nada de la capacidad. El plan inicial era escalar por la ocupación de la KV-Cache de vLLM (`vllm:kv_cache_usage_perc`, ver [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm)); se eligió la demanda en tokens porque es coherente con lo que admite el ledger mientras la reserva sea pesimista (FI-1). Validado en minikube con vLLM falsos ([Fase 7](docs/servicio/15-fase-7-decisiones.md)). |
 | **Contabilidad de Capacidad** | Ocupación real de KV-Cache del motor. | **Reserva pesimista** (`prompt + max_new_tokens`) en el plano de control. | Simple, segura y atómica sin API de reserva en vLLM. Infrautiliza la GPU; ver [FI-1](#fi-1-reserva-pesimista-de-capacidad). |
-| **Espera ante saturación** | Rechazo inmediato (`503`) o cola ilimitada. | **Cola acotada por modelo** con timeout corto, adelantamiento acotado y barrera FIFO. | En LLM la capacidad se libera de forma continua: una cola corta absorbe picos, y acotarla por tokens y por tiempo evita la latencia descontrolada. Ver [decisiones de la Fase 2](docs/servicio/08-fase-2-decisiones.md). |
+| **Espera ante saturación** | Rechazo inmediato (`503`) o cola ilimitada. | **Cola acotada por modelo** con timeout corto, adelantamiento acotado y barrera FIFO. | En LLM la capacidad se libera de forma continua: una cola corta absorbe picos, y acotarla por tokens y por tiempo evita la latencia descontrolada. Ver [decisiones de la Fase 2](docs/servicio/09-fase-2-decisiones.md). |
 | **Topología del Control Plane** | Varias réplicas con estado compartido (Redis). | **Réplica única** con estado en memoria. | El *ledger* de leases solo es atómico si un único proceso es la puerta de entrada a cada worker. Ver [FI-2](#fi-2-plano-de-control-con-más-de-una-réplica). |
 
 ---
@@ -102,14 +102,14 @@ type Lease interface {
 - La capacidad se libera **en cuanto `ExecuteStream` retorna** (fin, error o `ctx.Done()`), no al llegar al `defer Release()`.
 - `Release` es idempotente y concurrente-segura; el `defer lease.Release()` cubre los caminos en los que nunca se llega a ejecutar.
 - Un *lease* tiene **TTL**: si no se ejecuta a tiempo, el worker recupera la capacidad (`ErrLeaseExpired`).
-- `CapacityChanged()` (Fase 2) es una señal en memoria, sin datos y agrupada: se emite una vez por lease liberado, nunca por token ni por bloque de KV-Cache. El scheduler la usa para despertar su cola ([decisión 2](docs/servicio/08-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)).
+- `CapacityChanged()` (Fase 2) es una señal en memoria, sin datos y agrupada: se emite una vez por lease liberado, nunca por token ni por bloque de KV-Cache. El scheduler la usa para despertar su cola ([decisión 2](docs/servicio/09-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)).
 
 ---
 
 ## 4. Scheduling y Routing Avanzado
 
 ### 4.1 Radix Tree para Prefix Caching
-El *Control Plane* mantiene en memoria un **Radix Tree** de los prefijos que tiene cada worker en su KV-Cache (implementado en la Fase 3, ver [`docs/servicio/09-fase-3-routing-por-prefijos.md`](docs/servicio/09-fase-3-routing-por-prefijos.md)).
+El *Control Plane* mantiene en memoria un **Radix Tree** de los prefijos que tiene cada worker en su KV-Cache (implementado en la Fase 3, ver [`docs/servicio/10-fase-3-decisiones.md`](docs/servicio/10-fase-3-decisiones.md)).
 - Cada prompt se corta en bloques de 16 tokens y cada bloque recibe un hash **encadenado** (identifica todo el prefijo hasta él), igual que el *prefix caching* de vLLM. Así cuenta cualquier prefijo compartido: *system prompt*, historial de una conversación o documentos de RAG.
 - Al llegar una petición, el Router busca, por worker, la coincidencia de prefijo más larga. Prueba primero los workers con el prefijo más largo cuya carga esté por debajo de un umbral (0,8), y después el resto del menos al más cargado. Sigue siendo `AcquireLease` quien decide si cabe.
 - Si el worker afín está cargado, la petición **desborda** al menos cargado, que pasa a tener también el prefijo: los prefijos populares se replican solos en vez de saturar un worker ([FI-6](#fi-6-el-radix-tree-solo-aproxima-la-caché-real-y-concentra-prefijos-populares)).
@@ -142,7 +142,7 @@ Esto valida el encolado, la concurrencia, los data races y la resiliencia del Co
 
 Cuando la arquitectura se despliegue en producción con **vLLM**:
 1. **Mitigación del Cold Start:** Los pods de vLLM no descargarán pesos desde internet. Se usarán volúmenes compartidos (ej. `ReadWriteMany` / hostPath cache) para mapear los 15-30GB de modelos directamente en la memoria del contenedor al arrancar.
-2. **Autoscaling por métricas de inferencia:** escalar los Pods (y los Node Pools de GPU) a partir de la saturación que ve la plataforma, no de la CPU. En la Fase 7 lo hace **KEDA** con una consulta de Prometheus en lugar de un operador propio ([decisiones](docs/servicio/16-fase-7-decisiones.md)).
+2. **Autoscaling por métricas de inferencia:** escalar los Pods (y los Node Pools de GPU) a partir de la saturación que ve la plataforma, no de la CPU. En la Fase 7 lo hace **KEDA** con una consulta de Prometheus en lugar de un operador propio ([decisiones](docs/servicio/15-fase-7-decisiones.md)).
 3. **vLLM Adapter:** El `SimulatedWorker` será reemplazado por un cliente gRPC/HTTP bidireccional conectado al servidor vLLM real.
 
 ---
@@ -150,6 +150,8 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 ## 7. Roadmap Técnico
 
 ### Fase 1 — Fundaciones y Data Plane Streaming
+> Decisiones (reconstruidas a posteriori a partir de §2, los documentos 01–07 y las FI): [`docs/servicio/08-fase-1-decisiones.md`](docs/servicio/08-fase-1-decisiones.md).
+
 - [x] Estructura base del proyecto en Go.
 - [x] Interfaces Core: `Worker`, `Lease`, `InferenceRequest`, `TokenChunk`.
 - [x] Implementación de `SimulatedWorker` con streaming vía canales.
@@ -157,7 +159,7 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] API HTTP local exponiendo endpoints Server-Sent Events (SSE).
 
 ### Fase 2 — Scheduler con Colas Acotadas y Load Shedding
-> Diseño para **una réplica** con **reserva pesimista** ([FI-1](#fi-1-reserva-pesimista-de-capacidad), [FI-2](#fi-2-plano-de-control-con-más-de-una-réplica)). Alcance redefinido según [FI-5](#fi-5-solapamiento-del-roadmap). Decisiones y trade-offs: [`docs/servicio/08-fase-2-decisiones.md`](docs/servicio/08-fase-2-decisiones.md).
+> Diseño para **una réplica** con **reserva pesimista** ([FI-1](#fi-1-reserva-pesimista-de-capacidad), [FI-2](#fi-2-plano-de-control-con-más-de-una-réplica)). Alcance redefinido según [FI-5](#fi-5-solapamiento-del-roadmap). Decisiones y trade-offs: [`docs/servicio/09-fase-2-decisiones.md`](docs/servicio/09-fase-2-decisiones.md).
 
 - [x] Reserva atómica de capacidad por tokens (desde la Fase 1).
 - [x] Simulador realista: longitud de salida variable e ITL dependiente de la carga.
@@ -168,7 +170,7 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Tests de contrato y de estrés con invariantes (`go test -race`), métricas en `/debug/scheduler` y generador de carga `cmd/loadgen`.
 
 ### Fase 3 — Inteligencia de Enrutamiento (KV-Cache)
-> Diseño, decisiones y mediciones: [`docs/servicio/09-fase-3-routing-por-prefijos.md`](docs/servicio/09-fase-3-routing-por-prefijos.md). Resuelve la parte de diseño de [FI-6](#fi-6-el-radix-tree-solo-aproxima-la-caché-real-y-concentra-prefijos-populares).
+> Diseño, decisiones y mediciones: [`docs/servicio/10-fase-3-decisiones.md`](docs/servicio/10-fase-3-decisiones.md). Resuelve la parte de diseño de [FI-6](#fi-6-el-radix-tree-solo-aproxima-la-caché-real-y-concentra-prefijos-populares).
 
 - [x] Implementación del Radix Tree en memoria (aristas comprimidas, capacidad LRU por worker).
 - [x] Detección y hasheo de prefijos compartidos en las requests (bloques de 16 tokens, hashes encadenados).
@@ -176,7 +178,7 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Caché de prefijos en el worker simulado, métricas de acierto previsto/real y `loadgen -prefixes`.
 
 ### Fase 4 — Resiliencia y Ciclo de Vida
-> Decisiones, implementación y mediciones: [`docs/servicio/10-fase-4-decisiones.md`](docs/servicio/10-fase-4-decisiones.md). Dos cambios sobre el plan original: healthchecks activos en lugar de heartbeats (vLLM no emite heartbeats), y la latencia alta solo desprioriza un worker en vez de aislarlo.
+> Decisiones, implementación y mediciones: [`docs/servicio/11-fase-4-decisiones.md`](docs/servicio/11-fase-4-decisiones.md). Dos cambios sobre el plan original: healthchecks activos en lugar de heartbeats (vLLM no emite heartbeats), y la latencia alta solo desprioriza un worker en vez de aislarlo.
 
 - [x] Healthchecks activos desde el registro (`Worker.Health`, histéresis 3/2) y detección de reinicios (`InstanceID`).
 - [x] Circuit breakers por worker: los abren fallos del worker y cuelgues; la latencia alta solo desprioriza (worker degradado).
@@ -186,7 +188,7 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Desconexiones de clientes propagadas al worker (hecho en la Fase 1, ver [FI-5](#fi-5-solapamiento-del-roadmap)).
 
 ### Fase 5 — Observabilidad
-> Decisiones e implementación: [`docs/servicio/11-fase-5-decisiones.md`](docs/servicio/11-fase-5-decisiones.md). Catálogo de métricas, dashboard, ejemplo de lectura y guía de diagnóstico: [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md).
+> Decisiones e implementación: [`docs/servicio/12-fase-5-decisiones.md`](docs/servicio/12-fase-5-decisiones.md). Catálogo de métricas, dashboard, ejemplo de lectura y guía de diagnóstico: [`docs/operaciones/03-observabilidad.md`](docs/operaciones/03-observabilidad.md).
 > Adelantado en la Fase 2: profundidad de cola, tiempo en cola p50/p99 y rechazos por motivo en `GET /debug/scheduler` (JSON, sin Prometheus).
 
 - [x] Instrumentación de logs estructurados (slog): eventos de ciclo de vida del scheduler, log por petición con `outcome`, `X-Request-Id`.
@@ -217,7 +219,7 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] Mediciones relativas (FI-1, FI-3, FI-6) y benchmark router frente a round-robin: con vLLM real, la afinidad sube el acierto de caché del 53 % al 75 % y baja el TTFT mediano ~5× (relativo, en CPU).
 
 ### Fase 7 — Kubernetes en local (Autoscaling)
-> En minikube, sin GPUs. Una réplica del plano de control con `Recreate` ([FI-2](#fi-2-plano-de-control-con-más-de-una-réplica)). Decisiones y resultados: [`docs/servicio/16-fase-7-decisiones.md`](docs/servicio/16-fase-7-decisiones.md).
+> En minikube, sin GPUs. Una réplica del plano de control con `Recreate` ([FI-2](#fi-2-plano-de-control-con-más-de-una-réplica)). Decisiones y resultados: [`docs/servicio/15-fase-7-decisiones.md`](docs/servicio/15-fase-7-decisiones.md).
 
 - [x] Despliegue mediante Helm (`deploy/helm/llm-platform`, `task k8s:up`): plataforma, vLLM falsos, vLLM en CPU opcional, Prometheus y Grafana con el mismo dashboard y alertas.
 - [x] Descubrimiento de workers por el DNS de un Service *headless* (`-vllm-dns`); las bajas se drenan sin cortar streams.
@@ -228,6 +230,8 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 ---
 
 ## 8. Desarrollo Local
+
+> Guía completa de cada entorno (requisitos, variantes, problemas conocidos): [`docs/operaciones/01-entorno-local.md`](docs/operaciones/01-entorno-local.md). Tests: [`docs/operaciones/02-tests.md`](docs/operaciones/02-tests.md).
 
 **Requisitos:**
 - Go 1.23+
@@ -282,7 +286,7 @@ task k8s:down                       # borra el perfil
 | `GET /debug/workers` | `WorkerSnapshot` de cada worker (presupuesto, reservado, leases, acierto real de su caché de prefijos). |
 | `GET /debug/scheduler` | Estado de la cola: peticiones y tokens en cola por modelo, tiempo en cola p50/p99, rechazos por motivo; con afinidad, sus contadores y el tamaño del Radix Tree (`placement`). |
 | `GET /healthz` | Liveness. |
-| `GET /metrics` | Métricas Prometheus (Fase 5); catálogo en [`12-observabilidad.md`](docs/servicio/12-observabilidad.md). |
+| `GET /metrics` | Métricas Prometheus (Fase 5); catálogo en [`03-observabilidad.md`](docs/operaciones/03-observabilidad.md). |
 | `POST /debug/workers`, `DELETE /debug/workers/{id}` | Alta de un worker simulado y baja con drenaje (Fase 4). |
 | `POST /debug/workers/{id}/faults`, `.../restart` | Inyectar fallos (`{"down": true}`, `{"hang": true}`, `{"error_rate": 0.3}`, …; `{}` los quita) o simular un reinicio. |
 
@@ -298,8 +302,12 @@ curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 **Estructura:** todo el código fuente vive en `platform/`, que es el módulo Go (`go.mod`). Las tareas de `Taskfile.yml` ya se ejecutan dentro de esa carpeta; para usar `go` directamente, haz antes `cd platform`. En este README y en `docs/`, las rutas de paquetes (`internal/...`, `cmd/...`) son relativas a `platform/`.
 ```text
 README.md, Taskfile.yml
-docs/servicio/                  # documentación detallada de la implementación
+docs/analisis-final.md          # resumen para defender el proyecto: razonamientos, evidencias, limitaciones
+docs/servicio/                  # el servicio en Go: arquitectura y decisiones de cada fase
+docs/operaciones/               # entornos locales, tests, observabilidad y resultados de las pruebas
 deploy/observability/           # docker-compose con Prometheus y Grafana, alertas y dashboard (Fase 5)
+deploy/helm/llm-platform/       # chart de Helm para Kubernetes en local (Fase 7)
+.github/workflows/ci.yml        # CI: gofmt, vet, tests con -race y helm lint
 platform/                       # módulo Go llm-inference-platform
 ├── go.mod
 ├── cmd/platform/               # binario: flags, wiring, graceful shutdown, /debug de administración de workers
@@ -326,13 +334,13 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 
 ### FI-1. Reserva pesimista de capacidad
 - **Decisión actual:** cada lease reserva `prompt_tokens + max_new_tokens` (peor caso) durante todo el stream (`InferenceRequest.TokenCost`).
-- **Problema:** vLLM no reserva el peor caso: asigna bloques de KV-Cache a medida que genera y, si se queda sin memoria, expulsa (*preemption*) peticiones. Los clientes suelen pedir `max_tokens` de 2–4K con salidas reales de unos cientos de tokens, así que rechazaremos peticiones (`503`) con la GPU lejos de estar llena. Además, con *prefix caching* los bloques de un prefijo compartido se cuentan una vez por petición, lo que choca con el routing por afinidad de la Fase 3: concentra en un worker peticiones que comparten prefijo, y su carga de ledger se sobrestima aún más (medido en la Fase 3; ver [`09`](docs/servicio/09-fase-3-routing-por-prefijos.md#interacción-con-fi-1-la-reserva-pesimista)).
+- **Problema:** vLLM no reserva el peor caso: asigna bloques de KV-Cache a medida que genera y, si se queda sin memoria, expulsa (*preemption*) peticiones. Los clientes suelen pedir `max_tokens` de 2–4K con salidas reales de unos cientos de tokens, así que rechazaremos peticiones (`503`) con la GPU lejos de estar llena. Además, con *prefix caching* los bloques de un prefijo compartido se cuentan una vez por petición, lo que choca con el routing por afinidad de la Fase 3: concentra en un worker peticiones que comparten prefijo, y su carga de ledger se sobrestima aún más (medido en la Fase 3; ver [`10`](docs/servicio/10-fase-3-decisiones.md#interacción-con-fi-1-la-reserva-pesimista)).
 - **Opciones:**
   - Reservar `prompt + salida esperada` (p. ej. p90 histórico por modelo/cliente) y aceptar *overbooking*, usando la preemption del motor como red de seguridad.
   - Liberar progresivamente la parte no usada de la reserva y descontar los tokens de prefijo ya cacheados.
   - Usar el lease solo como *slot* de admisión y tomar la ocupación real de las métricas del motor.
 - **Revisar:** al medir la utilización real con vLLM (Fase 6).
-- **Medido (2026-11-21, Fase 6b-CPU):** con vLLM real en CPU, el ledger reservó de media ~3× la KV-Cache que vLLM ocupaba (29,5 % frente a 9,6 %), sobre todo porque cobra el prompt completo aunque esté en caché. El cambio de la reserva queda para una fase propia. Ver [`14`](docs/servicio/14-fase-6b-cpu-decisiones.md#fi-1-reserva-del-ledger-frente-a-kv-cache-real).
+- **Medido (2026-11-21, Fase 6b-CPU):** con vLLM real en CPU, el ledger reservó de media ~3× la KV-Cache que vLLM ocupaba (29,5 % frente a 9,6 %), sobre todo porque cobra el prompt completo aunque esté en caché. El cambio de la reserva queda para una fase propia. Ver [`resultados`](docs/operaciones/04-resultados-de-pruebas.md#fi-1-reserva-del-ledger-frente-a-kv-cache-real).
 
 ### FI-2. Plano de control con más de una réplica
 - **Decisión actual:** una sola réplica del plano de control; el *ledger* de leases vive en la memoria del proceso.
@@ -342,7 +350,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
   - Estado compartido (Redis/etcd) con operaciones atómicas, aceptando la latencia extra y la dependencia que hoy se excluye en *No objetivos*.
   - Admisión en el propio worker: un sidecar junto a cada vLLM es la fuente de verdad del presupuesto y las réplicas solo enrutan.
   - Leases con renovación (*heartbeat*) para recuperar la capacidad si la réplica que los emitió muere a mitad de stream.
-- **Fase 7:** se despliega una réplica con estrategia `Recreate`, para que ni siquiera durante una actualización haya dos *ledgers* a la vez; el precio es un corte breve en cada despliegue ([decisión 7](docs/servicio/16-fase-7-decisiones.md#decisión-7-una-réplica-con-recreate-fi-2)).
+- **Fase 7:** se despliega una réplica con estrategia `Recreate`, para que ni siquiera durante una actualización haya dos *ledgers* a la vez; el precio es un corte breve en cada despliegue ([decisión 7](docs/servicio/15-fase-7-decisiones.md#decisión-7-una-réplica-con-recreate-fi-2)).
 - **Revisar:** si se necesita alta disponibilidad o más throughput del que da una réplica.
 
 ### FI-3. Estimación de tokens sin tokenizer
@@ -367,7 +375,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 ### FI-6. El Radix Tree solo aproxima la caché real y concentra prefijos populares
 - **Problema:** el router no ve las expulsiones (*evictions*) que hace vLLM en su caché, así que el árbol puede apuntar a prefijos que ya no están. Además, la afinidad pura envía todo el tráfico de un *system prompt* popular al mismo worker y lo satura.
 - **Opciones:** TTL/LRU en las entradas del árbol; una puntuación que combine afinidad de prefijo y carga (p. ej. seguir la afinidad solo si la carga está por debajo de un umbral, o *power of two choices* entre los workers con el prefijo); replicar prefijos calientes en varios workers; usar eventos de KV-Cache del motor si la versión de vLLM los publica.
-- **Decisión (2026-11-17, Fase 3):** LRU por worker con la capacidad estimada de su caché (expulsión por hojas), afinidad solo por debajo de una carga de 0,8 y desbordamiento al menos cargado, que replica los prefijos calientes sin configurarlos. En el simulador, el acierto previsto por el árbol quedó a menos de 1 punto del real, y un único *system prompt* para todo el tráfico se replicó en los 3 workers tras 2 desbordamientos. Ver [`09`](docs/servicio/09-fase-3-routing-por-prefijos.md).
+- **Decisión (2026-11-17, Fase 3):** LRU por worker con la capacidad estimada de su caché (expulsión por hojas), afinidad solo por debajo de una carga de 0,8 y desbordamiento al menos cargado, que replica los prefijos calientes sin configurarlos. En el simulador, el acierto previsto por el árbol quedó a menos de 1 punto del real, y un único *system prompt* para todo el tráfico se replicó en los 3 workers tras 2 desbordamientos. Ver [`10`](docs/servicio/10-fase-3-decisiones.md).
 - **Sigue abierto:** el árbol imita la caché porque una sola réplica ve todo el tráfico (FI-2); desde la Fase 4 detecta los reinicios de workers (cambio de `InstanceID`), pero no ve las diferencias de la *chat template* real; los eventos de KV-Cache de vLLM se valorarán en la Fase 6.
 - **Revisar:** en la Fase 6, con la caché real de vLLM.
 - **Medido (2026-11-21, Fase 6b-CPU):** con vLLM real (expulsiones reales, bloques de 128), el acierto previsto por el árbol (75,7 %) quedó a menos de un punto del real (75,0 %).
@@ -390,7 +398,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Decisión actual:** tras obtener el lease, el handler escribe `200` y las cabeceras SSE antes de que `ExecuteStream` produzca el primer chunk.
 - **Problema:** vLLM puede rechazar la petición al empezar (p. ej. `prompt + max_tokens` mayor que `--max-model-len` según su tokenizer real, que puede no coincidir con nuestra estimación, FI-3). Ese rechazo llegaría como error *en banda* dentro de un stream `200`, en lugar de un `400` que los clientes y los benchmarks clasifican correctamente.
 - **Opciones:** retrasar la escritura de cabeceras hasta el primer chunk o hasta la primera respuesta de vLLM (el cliente no recibe cabeceras hasta que el worker responde, y el handler se complica); validar la longitud con el tokenizer real antes de admitir (ligado a FI-3).
-- **Resuelto (2026-11-18, Fase 4):** las cabeceras se envían con el primer chunk. Un fallo antes del primer token se reintenta en otro worker y, si no se puede, llega al cliente con su código (`503 worker_unavailable`, o `400` si el motor rechaza la petición). Queda para la Fase 6 que el `VLLMAdapter` traduzca el `400` de vLLM a `ErrRequestTooLarge` y no a `ErrWorkerFailure`. Ver [`10`](docs/servicio/10-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9).
+- **Resuelto (2026-11-18, Fase 4):** las cabeceras se envían con el primer chunk. Un fallo antes del primer token se reintenta en otro worker y, si no se puede, llega al cliente con su código (`503 worker_unavailable`, o `400` si el motor rechaza la petición). Queda para la Fase 6 que el `VLLMAdapter` traduzca el `400` de vLLM a `ErrRequestTooLarge` y no a `ErrWorkerFailure`. Ver [`11`](docs/servicio/11-fase-4-decisiones.md#decisión-4-reintentos-y-cabeceras-retrasadas-resuelve-fi-9).
 
 ### FI-10. `/metrics`, `/debug` y la administración comparten puerto con la API pública
 - **Decisión actual:** `cmd/platform` sirve en el mismo puerto la API, `GET /metrics` (Fase 5), `/debug/scheduler`, `/debug/workers` y los endpoints que dan de alta, de baja, rompen y reinician workers simulados (Fase 4).

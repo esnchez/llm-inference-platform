@@ -7,7 +7,7 @@ import (
 )
 
 // Observer receives the scheduler's events, for metrics (Phase 5,
-// docs/servicio/11-fase-5-decisiones.md, decision 2). internal/metrics
+// docs/servicio/12-fase-5-decisiones.md, decision 2). internal/metrics
 // implements it with Prometheus; the scheduler does not depend on any
 // metrics library. State that can be read at any time (queues, reserved
 // tokens, breaker states) is not reported here: collectors read it from

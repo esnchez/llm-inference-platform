@@ -101,7 +101,7 @@ func goodChat(maxTokens string) string {
 
 // TestCatalogue drives traffic that touches every area (success, invalid
 // requests, a failing worker with retries, breaker and health checks) and
-// checks that every metric of docs/servicio/12-observabilidad.md exists,
+// checks that every metric of docs/operaciones/03-observabilidad.md exists,
 // and that the names follow Prometheus conventions.
 func TestCatalogue(t *testing.T) {
 	bad := sim(t, "bad", simworker.Faults{ErrorRate: 1}) // fails streams, passes health checks

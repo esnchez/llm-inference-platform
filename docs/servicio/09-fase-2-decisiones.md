@@ -1,4 +1,4 @@
-# 8. Fase 2: decisiones de diseño
+# 9. Fase 2: decisiones de diseño
 
 Este documento recoge las decisiones de diseño de la Fase 2 (scheduler con colas acotadas, *load shedding* y tests de concurrencia intensa), con sus trade-offs y la opción elegida. Es el registro del *por qué*; cómo quedó implementado está en los documentos 1–7.
 
@@ -195,7 +195,7 @@ El 85 % de §4.2 del README está pensado para la ocupación **real** de KV-Cach
 
 Métricas en `/debug/scheduler`: profundidad de cola por modelo (peticiones y tokens), tiempo en cola p50/p99, rechazos por motivo (cola llena, timeout, cancelación) y ocupación por worker (ya en `/debug/workers`).
 
-El contador `LeasesRejected` de cada worker se infla con varios workers (ver [03](03-leases-y-capacidad.md#contabilidad-del-worker)). Con la cola, los rechazos reales al cliente se cuentan en el scheduler (`rejected_queue_full`, `rejected_queue_timeout`).
+El contador `LeasesRejected` de cada worker se infla con varios workers (ver [03](03-leases-y-capacidad.md#contabilidad-del-worker-internalledger)). Con la cola, los rechazos reales al cliente se cuentan en el scheduler (`rejected_queue_full`, `rejected_queue_timeout`).
 
 `task check:all` necesita Docker Desktop arrancado (o gcc para `test:race:local`). A medio plazo, un CI en Linux debería ejecutarlo en cada push.
 
@@ -203,7 +203,7 @@ El contador `LeasesRejected` de cada worker se infla con varios workers (ver [03
 
 ## Implementación (2026-11-09)
 
-Las siete decisiones están implementadas. Detalle del código en [01](01-arquitectura.md), [03](03-leases-y-capacidad.md), [04](04-worker-simulado.md), [05](05-api-http.md) y [07](07-concurrencia-y-tests.md).
+Las siete decisiones están implementadas. Detalle del código en [01](01-arquitectura.md), [03](03-leases-y-capacidad.md), [04](04-worker-simulado.md), [05](05-api-http.md) y [tests](../operaciones/02-tests.md).
 
 | Decisión | Dónde | Cómo quedó |
 | :--- | :--- | :--- |
@@ -232,13 +232,18 @@ Detalles que las siete decisiones dejaban abiertos:
 
 ### Primera medición con `loadgen`
 
-Dos workers de 8.192 tokens, valores por defecto del binario y `task loadgen -- -rate 30 -duration 8s` (10 % de peticiones tipo RAG, 5 % de clientes que cancelan):
+Con una sobrecarga deliberada de 2×, la cola absorbió lo que pudo y rechazó pronto el resto (49 % `200`, 46 % `503`) en lugar de alargar la latencia de todos. Montaje y cifras en [resultados](../operaciones/04-resultados-de-pruebas.md#fase-2-sobrecarga-deliberada-simulador).
 
-| Resultado | Peticiones |
+---
+
+## Qué pasó después
+
+Este documento es el registro de la fase tal como se decidió; lo que anunciaba para fases posteriores se resolvió así (estado al cerrar el proyecto, 2026-11-21):
+
+| Lo que quedó dicho aquí | Qué pasó |
 | :--- | :--- |
-| `200` | 49 % |
-| `503 queue_full` | 39 % |
-| `503 queue_timeout` | 7 % |
-| Canceladas por el cliente | 4 % |
-
-El 66 % de las admitidas pasó por la cola (75 de 118), con una espera p50 de 4,0 s. Es una sobrecarga deliberada (unas 29 peticiones por segundo, más del doble de lo que pueden servir dos workers) para comprobar que la cola absorbe lo que puede y rechaza pronto el resto. Ajustar los valores por defecto con cargas realistas queda pendiente.
+| El `VLLMAdapter` sería un objeto Go dentro del proceso del control plane (decisión 2). | Así se hizo en la Fase 6a ([13](13-fase-6a-decisiones.md)): el ledger de cada vLLM vive en el control plane y la señal de capacidad es un canal Go. |
+| El *load shedding* por umbral de ocupación se aplazaba a la Fase 6 (decisión 6). | **No se implementó.** Desde la 6a la plataforma lee la ocupación real de la KV-Cache de vLLM, pero solo la muestra; la admisión sigue rechazando por el estado de la cola. Va ligado a FI-1, que sigue abierta. |
+| La ITL dependiente de la carga se calibraría en la Fase 6 (decisión 1). | **No se calibró:** sin GPUs no hay cifras de referencia, y las de CPU no son trasladables (6b-CPU). El simulador sirve para comparar políticas, no para predecir latencias. |
+| Un CI en Linux debería ejecutar los tests en cada push (decisión 7). | **Hecho en la Fase 7:** GitHub Actions con `gofmt`, `go vet`, `go test -race` en Go 1.23 y `helm lint`. |
+| Intervalo mínimo entre pasadas del dispatcher: se añadiría si `loadgen` lo justificaba. | No hizo falta en ninguna prueba posterior, tampoco con vLLM real. |

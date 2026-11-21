@@ -75,7 +75,7 @@ Detalles:
 
 ## Caché de prefijos (Fase 3)
 
-Imita el *automatic prefix caching* de vLLM, lo justo para medir el router por prefijos ([09 · Decisión 7](09-fase-3-routing-por-prefijos.md#decisión-7-caché-de-prefijos-en-el-simulador)):
+Imita el *automatic prefix caching* de vLLM, lo justo para medir el router por prefijos ([10 · Decisión 7](10-fase-3-decisiones.md#decisión-7-caché-de-prefijos-en-el-simulador)):
 
 - **Unidad:** bloques de 16 tokens estimados, identificados por los hashes encadenados que calcula el control plane (`InferenceRequest.PrefixHashes`). El worker no hashea nada.
 - **Solo prefijos:** cuenta los bloques cacheados **desde el principio** hasta el primer fallo. Un bloque cacheado después de un fallo no sirve, porque su KV depende de todos los anteriores.
@@ -87,7 +87,7 @@ Con `-prefill-per-token 100us`, un *system prompt* de 1.500 tokens cuesta 150 ms
 
 ## Fallos simulados (Fase 4)
 
-Para que los healthchecks, el *circuit breaker* y los reintentos tengan algo que detectar ([10 · Decisión 6](10-fase-4-decisiones.md#decisión-6-fallos-simulados-en-simworker)). Se configuran en `Config.Faults` o en caliente con `SetFaults` (y desde `POST /debug/workers/{id}/faults`). Cada stream lee los fallos **al empezar**: cambiarlos no afecta a los streams en curso.
+Para que los healthchecks, el *circuit breaker* y los reintentos tengan algo que detectar ([11 · Decisión 6](11-fase-4-decisiones.md#decisión-6-fallos-simulados-en-simworker)). Se configuran en `Config.Faults` o en caliente con `SetFaults` (y desde `POST /debug/workers/{id}/faults`). Cada stream lee los fallos **al empezar**: cambiarlos no afecta a los streams en curso.
 
 | Campo (`json`) | Efecto | Imita |
 | :--- | :--- | :--- |
@@ -100,20 +100,20 @@ Para que los healthchecks, el *circuit breaker* y los reintentos tengan algo que
 
 `Restart()` simula un reinicio: los streams en curso fallan con `ErrWorkerFailure`, la caché de prefijos se vacía y el `InstanceID` que devuelve `Health` cambia (`sim-worker-1#0` → `sim-worker-1#1`). Los fallos inyectados se mantienen.
 
-## Lo que el simulador permite validar hoy
+## Lo que el simulador permite validar
 
 - **Admisión y cola:** con presupuestos pequeños (`-token-budget 600`) las peticiones esperan en la cola; `/debug/scheduler` muestra la espera y los `503` por cola llena o timeout. `task loadgen` genera tráfico realista para comparar configuraciones.
 - **Reparto:** `/debug/workers` muestra cómo la colocación reparte leases (`leases_granted`, `leases_rejected`).
-- **Routing por prefijos:** `task loadgen -- -prefixes 24` con `-placement prefix` y con `-placement round-robin` compara TTFT y acierto de caché ([09 · Mediciones](09-fase-3-routing-por-prefijos.md#mediciones)).
+- **Routing por prefijos:** `task loadgen -- -prefixes 24` con `-placement prefix` y con `-placement round-robin` compara TTFT y acierto de caché ([resultados · Mediciones](../operaciones/04-resultados-de-pruebas.md#fase-3-router-por-prefijos-frente-a-round-robin-simulador)).
 - **Cancelación:** con `-itl 1s` y un `curl` interrumpido se ve cómo `tokens_reserved` vuelve a 0 al instante.
-- **Resiliencia:** `task loadgen -- -chaos down` (o `hang`, `errors`, `stall`, `slow`, `restart`) rompe un worker durante la prueba; `/debug/workers` muestra su salud y su breaker, y `/debug/scheduler` los reintentos ([10 · Mediciones](10-fase-4-decisiones.md#mediciones-con-loadgen--chaos)).
-- **Concurrencia:** los tests lanzan cientos de goroutines contra un worker y verifican que no se pierde ni se sobrepasa capacidad (ver [07](07-concurrencia-y-tests.md)).
+- **Resiliencia:** `task loadgen -- -chaos down` (o `hang`, `errors`, `stall`, `slow`, `restart`) rompe un worker durante la prueba; `/debug/workers` muestra su salud y su breaker, y `/debug/scheduler` los reintentos ([resultados · Mediciones](../operaciones/04-resultados-de-pruebas.md#fase-4-fallos-con-loadgen--chaos-simulador)).
+- **Concurrencia:** los tests lanzan cientos de goroutines contra un worker y verifican que no se pierde ni se sobrepasa capacidad (ver [tests](../operaciones/02-tests.md)).
 
 ## Cómo hacerlo más realista (si hiciera falta)
 
-Las dos primeras se implementaron en la Fase 2 ([08 · Decisión 1](08-fase-2-decisiones.md#decisión-1-realismo-del-worker-simulado)): sin ellas, ninguna política de cola se podía evaluar. La tercera se implementó en la Fase 3 (ver [arriba](#caché-de-prefijos-fase-3)). Las tres están descritas en este documento.
+Las dos primeras se implementaron en la Fase 2 ([09 · Decisión 1](09-fase-2-decisiones.md#decisión-1-realismo-del-worker-simulado)): sin ellas, ninguna política de cola se podía evaluar. La tercera se implementó en la Fase 3 (ver [arriba](#caché-de-prefijos-fase-3)). Las tres están descritas en este documento.
 
-- **Salida de longitud variable** (parar antes de `MaxNewTokens` con `finish_reason: stop`): haría visible la infrautilización de la reserva pesimista (FI-1), hoy oculta porque reserva y uso coinciden.
-- **ITL dependiente de la carga** (por ejemplo `ITL × (1 + α·leases_activos)`): imitaría el efecto del *continuous batching*, donde más peticiones simultáneas suben el throughput total pero empeoran la latencia de cada una.
-- **Caché de prefijos simulada:** reducir el TTFT si el prefijo ya se vio en ese worker. Hacía falta para medir el router por prefijos de la Fase 3 sin GPU.
+- **Salida de longitud variable** (parar antes de `MaxNewTokens` con `finish_reason: stop`): hace visible la infrautilización de la reserva pesimista (FI-1), que antes quedaba oculta porque reserva y uso coincidían.
+- **ITL dependiente de la carga** (`ITL × (1 + α·leases_activos)`): imita el efecto del *continuous batching*, donde más peticiones simultáneas suben el throughput total pero empeoran la latencia de cada una.
+- **Caché de prefijos simulada:** reduce el TTFT si el prefijo ya se vio en ese worker. Hacía falta para medir el router por prefijos de la Fase 3 sin GPU.
 - **Pendiente, si hiciera falta:** que la caché comparta memoria con el presupuesto (los bloques cacheados ocupan sitio y se expulsan cuando una petición nueva lo necesita), como en vLLM. Va ligado a FI-1.

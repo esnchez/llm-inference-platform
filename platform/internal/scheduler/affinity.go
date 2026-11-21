@@ -58,7 +58,7 @@ func (c AffinityConfig) withDefaults() AffinityConfig {
 // PrefixAffinity is the Phase 3 Placement: it sends a request to the worker
 // that most likely holds the longest prefix of its prompt in the KV cache,
 // as long as that worker is not overloaded
-// (docs/servicio/09-fase-3-decisiones.md).
+// (docs/servicio/10-fase-3-decisiones.md).
 //
 // Order in which workers are tried (first lease granted wins):
 //

@@ -23,6 +23,8 @@ func (r InferenceRequest) TokenCost() int { return r.PromptTokens + r.MaxNewToke
 
 En un motor de LLM lo que se agota es la **memoria de KV-Cache**, y crece con el número de tokens de cada secuencia (prompt + generados), no con el número de peticiones. Contar "peticiones en vuelo" trataría igual un prompt de 8K tokens que uno de 100.
 
+Con un motor real que informa su `max_model_len`, el scheduler recorta antes `max_new_tokens` a lo que cabe en el contexto, como hace vLLM (Fase 6b-CPU), y se reserva lo recortado.
+
 La reserva es **pesimista**: se reserva el peor caso (`max_new_tokens` completo) durante todo el stream. Es una decisión consciente: es simple, nunca sobrecompromete al worker y es atómica sin ayuda del motor. El precio es infrautilizar la GPU cuando los clientes piden `max_tokens` mucho mayores que lo que realmente generan. Alternativas registradas en **FI-1**.
 
 ## El contrato
@@ -53,13 +55,13 @@ Reglas que toda implementación (simulada o vLLM) debe cumplir:
 | `ExecuteStream` **nunca cierra `out`**; el canal es del llamador. | Quien crea el canal decide cuándo se cierra. Evita *panics* por doble cierre si alguien reutiliza el canal. `StartStream` aplica el patrón correcto. |
 | La capacidad se libera **en cuanto `ExecuteStream` retorna**, sea cual sea el motivo. | Un cliente que se desconecta debe liberar VRAM *ya*, no cuando el handler llegue a su `defer`. |
 | `Release` es **idempotente** y segura en concurrencia. | Se llama desde varios sitios (el `defer` del handler, el final de `ExecuteStream`, el TTL); solo la primera tiene efecto. |
-| `CapacityChanged()` se emite **una vez por lease liberado**, agrupada (canal con buffer 1 y envío no bloqueante) y sin datos. | El dispatcher reintenta en cuanto hay capacidad, sin sondeo ni tormentas de eventos. Perderla o duplicarla no rompe nada: la verdad está en `AcquireLease` ([08 · Decisión 2](08-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)). |
+| `CapacityChanged()` se emite **una vez por lease liberado**, agrupada (canal con buffer 1 y envío no bloqueante) y sin datos. | El dispatcher reintenta en cuanto hay capacidad, sin sondeo ni tormentas de eventos. Perderla o duplicarla no rompe nada: la verdad está en `AcquireLease` ([09 · Decisión 2](09-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)). |
 | Un lease no ejecutado **expira** tras el TTL (`ErrLeaseExpired`). | Un lease que nadie ejecuta (bug, *panic*, cliente perdido entre admisión y stream) retendría capacidad para siempre. |
 | Los errores se comparan con `errors.Is`. | Las implementaciones pueden añadir contexto (`"w1: at capacity"`) sin romper la clasificación. |
 
 **Desde la Fase 6a, estas reglas se implementan una sola vez**, en `internal/ledger`, y las usan tanto `simworker` como el adaptador de vLLM. Cada worker solo aporta un `Executor` (cómo se ejecuta un stream). La batería `internal/workertest` comprueba el contrato (admisión, un solo uso, cancelación, TTL, señal de capacidad, concurrencia) contra ambas implementaciones. Además, el ledger admite un límite por petición (`MaxRequestTokens`, el `max_model_len` del motor): una petición que cabe en el presupuesto pero lo supera da `ErrRequestTooLarge`, y el scheduler la rechaza con `400` sin encolarla.
 
-Reglas añadidas en la Fase 4 ([10](10-fase-4-decisiones.md)):
+Reglas añadidas en la Fase 4 ([11](11-fase-4-decisiones.md)):
 
 | Regla | Motivo |
 | :--- | :--- |
@@ -71,7 +73,7 @@ Reglas añadidas en la Fase 4 ([10](10-fase-4-decisiones.md)):
 ### Patrón de uso
 
 ```go
-lease, err := pool.Acquire(ctx, req)
+lease, err := sched.Acquire(ctx, req)
 if err != nil { /* 404 / 400 / 503 */ }
 defer lease.Release()                       // cubre los caminos sin ExecuteStream
 
@@ -115,10 +117,12 @@ Tres caminos pueden liberar: `Release()`, `expire()` (TTL) y el `defer l.Release
 
 La carrera delicada es **TTL contra `ExecuteStream`**: el temporizador puede dispararse justo cuando empieza la ejecución. `begin()` para el temporizador, pero si la función del TTL ya estaba en marcha, se quedará esperando el mutex. Cuando lo obtenga verá estado `Executing` (o `Released`, si el stream ya terminó) y no hará nada, porque `expire()` solo actúa en estado `Acquired`. Lo comprueban `TestLeaseExpiresWhenNotExecuted` y `TestLeaseDoesNotExpireOnceExecuting`.
 
-## Contabilidad del worker
+## Contabilidad del worker (`internal/ledger`)
+
+Desde la Fase 6a vive en `ledger.Ledger`, que comparten el simulador y el adaptador de vLLM:
 
 ```go
-type Worker struct {
+type Ledger struct {
     mu       sync.Mutex
     reserved int    // tokens reservados ahora
     active   int    // leases vivos
@@ -138,13 +142,13 @@ type Worker struct {
 
 El mutex solo protege aritmética de enteros: nunca se mantiene durante esperas ni E/S, así que no es un cuello de botella aunque haya miles de peticiones.
 
-`Snapshot()` copia estos valores bajo el mismo mutex. Es **solo informativa** (para `/debug/workers` y, en el futuro, métricas): ninguna decisión de admisión debe basarse en ella, por la carrera descrita al principio.
+`Snapshot()` copia estos valores bajo el mismo mutex. Es **solo informativa** (para `/debug/workers` y las métricas de la Fase 5): ninguna decisión de admisión debe basarse en ella, por la carrera descrita al principio.
 
 **Ojo con `rejected`:** cuenta rechazos *por worker*. Cada intento de colocación que encuentra un worker lleno suma 1 en ese worker, así que con varios workers (y con la cola, que reintenta) la suma de `leases_rejected` no corresponde a los `503` reales. Desde la Fase 2, los rechazos reales al cliente se cuentan en el scheduler (`rejected_queue_full` y `rejected_queue_timeout` en `/debug/scheduler`); `leases_rejected` solo cuenta intentos de colocación fallidos, que con la cola son normales.
 
 ## El ledger de capacidad
 
-El **ledger** es el libro de cuentas de tokens reservados que lleva cada worker en el control plane: la contabilidad de cuánta capacidad está comprometida, **no la memoria real de la GPU**. En `simworker` son los campos de arriba (`TokenBudget`, `reserved`, `active`, `granted`, `rejected`), protegidos por `Worker.mu`, y se ven en `GET /debug/workers`.
+El **ledger** es el libro de cuentas de tokens reservados que lleva cada worker en el control plane: la contabilidad de cuánta capacidad está comprometida, **no la memoria real de la GPU**. Son los campos de arriba (`TokenBudget`, `reserved`, `active`, `granted`, `rejected`), protegidos por `Ledger.mu`, y se ven en `GET /debug/workers` y en las métricas `llmplatform_worker_tokens_*`.
 
 - **Cargo** (`AcquireLease`): si `reserved + coste ≤ TokenBudget`, entonces `reserved += coste`.
 - **Abono** (`free()`): al terminar el stream, en `Release()` o al vencer el TTL, `reserved -= coste`, exactamente una vez.
@@ -161,8 +165,8 @@ Consecuencias:
 
 - Con reserva pesimista, el ledger siempre marca **más** ocupación que la real: es seguro pero desperdicia capacidad (**FI-1**).
 - Vive en un solo proceso: dos réplicas del control plane tendrían dos ledgers del mismo vLLM y reservarían de más (**FI-2**).
-- Con vLLM real, el ledger lo seguirá llevando el `VLLMAdapter` dentro del control plane, porque vLLM no ofrece una API de reserva (ver [06](06-relacion-con-vllm.md)).
-- La señal `CapacityChanged()` de la Fase 2 observa cambios del ledger, no de los bloques de vLLM; por eso se emite una vez por petición (ver [08](08-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)).
+- Con vLLM real, el ledger lo lleva el `VLLMAdapter` dentro del control plane, porque vLLM no ofrece una API de reserva (ver [06](06-relacion-con-vllm.md)). Medido con vLLM en CPU: reserva de media ~3 veces lo que vLLM ocupa (FI-1).
+- La señal `CapacityChanged()` de la Fase 2 observa cambios del ledger, no de los bloques de vLLM; por eso se emite una vez por petición (ver [09](09-fase-2-decisiones.md#decisión-2-cómo-se-entera-el-scheduler-de-que-hay-capacidad-libre)).
 
 ## El TTL del lease
 

@@ -12,7 +12,7 @@ import (
 )
 
 // This file is the worker registry of Phase 4
-// (docs/servicio/10-fase-4-decisiones.md, decisions 1–3): adding and
+// (docs/servicio/11-fase-4-decisiones.md, decisions 1–3): adding and
 // draining workers, health checks, the circuit breaker and the "degraded"
 // mark that only deprioritises slow workers. All member state is guarded by
 // Scheduler.mu.

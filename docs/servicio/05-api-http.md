@@ -6,9 +6,9 @@ vLLM expone una API compatible con OpenAI, y herramientas como `llmperf` (benchm
 
 - Apuntar cualquier cliente existente a la plataforma sin adaptadores.
 - Comparar en la Fase 6 "router inteligente" contra "vLLM directo" con la misma herramienta y el mismo tráfico.
-- Que el futuro `VLLMAdapter` sea casi un *passthrough* del mismo formato.
+- Que el `VLLMAdapter` (Fase 6a) sea casi un *passthrough* del mismo formato: reenvía los mensajes y los parámetros, y traduce el SSE de vLLM evento a evento.
 
-Solo se implementa el subconjunto que el control plane necesita hoy.
+Solo se implementa el subconjunto que el control plane sabe atender; el resto se rechaza con `400` explícito (ver [Petición](#petición)).
 
 ## Endpoints
 
@@ -17,11 +17,13 @@ Solo se implementa el subconjunto que el control plane necesita hoy.
 | `POST /v1/chat/completions` | Inferencia. SSE si `stream: true`; JSON si no. |
 | `GET /v1/models` | `{"object":"list","data":[{"id":"sim-llama-3-8b","object":"model","owned_by":"llm-inference-platform"}]}` |
 | `GET /debug/workers` | Array de `WorkerSnapshot` (presupuesto, reservado, leases activos, concedidos, rechazados y, con caché de prefijos, `prefix_cache_blocks`, `prefix_cache_used`, `prefix_blocks_queried` y `prefix_blocks_hit`). |
-| `GET /debug/scheduler` | Estado de la admisión: peticiones y tokens en cola por modelo, límite de la cola, edad de la cabeza, admitidas (directas y desde la cola), rechazos por motivo, despertares con barrera y tiempo en cola p50/p99. Con `-placement prefix`, un bloque `placement` con los contadores de afinidad y el tamaño del radix tree ([09 · Métricas](09-fase-3-routing-por-prefijos.md#métricas)). |
+| `GET /debug/scheduler` | Estado de la admisión: peticiones y tokens en cola por modelo, límite de la cola, edad de la cabeza, admitidas (directas y desde la cola), rechazos por motivo, despertares con barrera y tiempo en cola p50/p99. Con `-placement prefix`, un bloque `placement` con los contadores de afinidad y el tamaño del radix tree ([10 · Métricas](10-fase-3-decisiones.md#métricas)). |
 | `GET /healthz` | `200 ok` (liveness). |
-| `GET /metrics` | Métricas en formato Prometheus (Fase 5). Lo sirve `cmd/platform`; catálogo en [12 · Observabilidad](12-observabilidad.md#catálogo-de-métricas). |
+| `GET /metrics` | Métricas en formato Prometheus (Fase 5). Lo sirve `cmd/platform`; catálogo en [observabilidad · Observabilidad](../operaciones/03-observabilidad.md#catálogo-de-métricas). |
 
 `/debug/workers` incluye desde la Fase 4 un objeto `status` por worker: `state` (`active`/`draining`), `healthy`, `breaker` (`closed`/`open`/`half-open`), `degraded`, `itl_ms`, `in_flight`, `failures`, `breaker_opens` e `instance_id`. `/debug/scheduler` añade `worker_failures`, `ttft_timeouts`, `stall_timeouts`, `retries`, `retry_successes`, `breaker_opens`, `restarts_detected` y `rejected_no_healthy_workers`.
+
+Con `-admin-addr` (Fase 7, FI-10), `/debug/*`, `/metrics` y la [administración de workers simulados](#administración-de-workers-simulados-fase-4) se sirven **solo** en ese puerto, y el de la API responde `404` a esas rutas. Sin el flag, todo está en el mismo puerto.
 
 Las rutas usan los patrones con método de `net/http` (Go ≥ 1.22): un `GET` a `/v1/chat/completions` devuelve `405` automáticamente.
 
@@ -50,8 +52,6 @@ Las rutas usan los patrones con método de `net/http` (Go ≥ 1.22): un `GET` a 
 | `n`, `best_of` (≠ 1), `logprobs` (`true`), `top_logprobs`, `prompt_logprobs`, `tools`, `tool_choice`, `functions`, `function_call` | **`400`** con la lista de campos y el motivo: la plataforma no sabría reservar capacidad para varias respuestas ni devolver logprobs o llamadas a herramientas (Fase 6a). `null` equivale a ausente. |
 | Cualquier otro (`temperature`, `top_p`, `stop`, `seed`, `presence_penalty`, `response_format`, `top_k`, `min_p`…) | Se **reenvía al motor sin interpretar** (Fase 6a). El simulador los ignora; vLLM los aplica o responde `400` si no los conoce. |
 
-Campos aceptados por OpenAI pero **ignorados** hoy: `temperature`, `top_p`, `stop`, `n`, `tools`, etc. El decodificador JSON no es estricto, así que no provocan error. Cuando exista el adaptador de vLLM habrá que reenviarlos (ver [06](06-relacion-con-vllm.md)).
-
 ## Respuesta en streaming (SSE)
 
 El `200` y las cabeceras SSE se envían **con el primer token**, no al admitir la petición (Fase 4). Si el worker falla antes, la petición se reintenta en otro sin que el cliente lo note; si no hay alternativa, el cliente recibe un error normal (`503 worker_unavailable` con `Retry-After`) en lugar de un stream roto.
@@ -71,7 +71,7 @@ data: [DONE]
 - Un evento por token, con *flush* inmediato.
 - El primer chunk incluye `delta.role`.
 - El último chunk de contenido incluye `finish_reason`. OpenAI y vLLM suelen enviarlo en un chunk aparte con `delta` vacío; ambas formas son válidas para los clientes.
-- `usage.prompt_tokens` es la **estimación** (FI-3) y `completion_tokens` es el número de chunks emitidos.
+- `usage` lleva los tokens que contó el motor cuando los informa (vLLM, Fase 6a). Con el simulador, `prompt_tokens` es la **estimación** (FI-3) y `completion_tokens` el número de chunks emitidos.
 - Cabeceras: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`, `X-Request-Id`, `X-Worker-Id`.
 
 ### Errores a mitad de stream
@@ -112,7 +112,7 @@ Salvo el `405`, todos usan el formato de OpenAI:
 | HTTP | `type` / `code` | Causa |
 | :--- | :--- | :--- |
 | `400` | `invalid_request_error` | JSON inválido, cuerpo mayor de 4 MB, sin `model`/`messages`, `max_tokens` fuera de rango. |
-| `400` | `invalid_request_error` / `context_length_exceeded` | `prompt + max_tokens` supera el presupuesto de **todos** los workers del modelo: no cabrá nunca. |
+| `400` | `invalid_request_error` / `context_length_exceeded` | `prompt + max_tokens` supera el presupuesto de **todos** los workers del modelo (no cabrá nunca), o el prompt por sí solo no cabe en el `max_model_len` del motor; también si vLLM rechaza la petición por longitud al empezar. |
 | `404` | `invalid_request_error` / `model_not_found` | Ningún worker sirve el modelo. |
 | `405` | — (texto plano de `net/http`) | Método incorrecto en una ruta conocida. |
 | `503` | `server_overloaded` / `queue_full` + `Retry-After` | La cola del modelo está llena (límite por tokens) o se alcanzó el tope global de peticiones en espera. |

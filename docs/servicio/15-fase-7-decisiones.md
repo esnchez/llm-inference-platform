@@ -1,8 +1,8 @@
-# 16. Fase 7: Kubernetes en local — decisiones de diseño
+# 15. Fase 7: Kubernetes en local — decisiones de diseño
 
 Este documento recoge las decisiones de la Fase 7: desplegar la plataforma en Kubernetes en local, con descubrimiento de workers y autoscaling. Mantiene el criterio de la Fase 6b-CPU: **un sistema funcional y sencillo, con sus limitaciones documentadas**, frente a uno completo y complejo.
 
-> **Estado (2026-11-21): implementada y validada en minikube.** Se aplicaron las ocho decisiones recomendadas. Resultados al final: [Resultados de la validación](#resultados-de-la-validación).
+> **Estado (2026-11-21): implementada y validada en minikube.** Se aplicaron las ocho decisiones recomendadas. Resultados: [operaciones · resultados](../operaciones/04-resultados-de-pruebas.md#fase-7-kubernetes-en-minikube).
 >
 > **Código:** `-admin-addr` y `-vllm-dns` en `cmd/platform`; observador de DNS en `internal/vllm/dnswatch.go`; apagado ordenado en `cmd/fakevllm`; chart en `deploy/helm/llm-platform`; tareas `k8s:*` en el `Taskfile.yml`; CI en `.github/workflows/ci.yml`.
 
@@ -43,7 +43,7 @@ El roadmap pedía tres cosas: despliegue con Helm, almacenamiento compartido par
 | :--- | :--- | :--- |
 | Plataforma | Deployment (1 réplica, `Recreate`), Service `platform` (API, puerto 8080), Service `platform-admin` (8081) | Lee los workers del DNS de `fakevllm` (y de `vllm-cpu` si está activado). |
 | vLLM falsos | Deployment + Service *headless* `fakevllm` | Lo que escala KEDA. |
-| vLLM en CPU | Deployment + Service *headless* `vllm-cpu` + PVC para la caché del modelo | **Desactivado por defecto** (~6 GB y ~6 min de arranque). Sin autoscaling. |
+| vLLM en CPU | Deployment + Service *headless* `vllm-cpu` + PVC para la caché del modelo | **Desactivado por defecto** (imagen de 1,8 GB, ~6 GB de memoria y ~6 min de arranque). Sin autoscaling. |
 | Prometheus | Deployment + ConfigMap | Descubre los pods por el DNS de los Services *headless* (`dns_sd_configs`). Datos efímeros. |
 | Grafana | Deployment + ConfigMaps | El **mismo** dashboard y las **mismas** alertas que el stack de Docker: se pasan al chart con `--set-file`, así que no hay copias. |
 
@@ -77,7 +77,7 @@ Un `ScaledObject` sobre el Deployment `fakevllm`, con un disparador de Prometheu
 sum(llmplatform_worker_tokens_reserved) + sum(llmplatform_queue_tokens)
 ```
 
-Es la **demanda en tokens**: lo reservado ahora más lo que espera en cola. El umbral es la capacidad objetivo por réplica (70 % del presupuesto de un vLLM falso). KEDA calcula `réplicas = ⌈demanda / umbral⌉` entre un mínimo de 1 y un máximo de 4, con una espera de 60 s antes de reducir.
+Es la **demanda en tokens**: lo reservado ahora más lo que espera en cola. El umbral es la capacidad objetivo por réplica (70 % del presupuesto de un vLLM falso). KEDA calcula `réplicas = ⌈demanda / umbral⌉` entre un mínimo de 1 y un máximo de 4. La bajada la gobierna la estabilización del HPA que crea KEDA (30 s en la demo; Kubernetes usa 300 s por defecto); el `cooldownPeriod` de KEDA (60 s) solo cuenta para escalar a cero, que aquí no se usa.
 
 | Opción | A favor | En contra |
 | :--- | :--- | :--- |
@@ -106,7 +106,7 @@ Fuera: operador propio (sustituido por KEDA), varias réplicas (FI-2), Ingress y
 2. **Chart** (2), con KEDA (5) y la estrategia `Recreate` (7).
 3. **Tareas:** `task k8s:up` (perfil de minikube, imágenes, KEDA, chart), `task k8s:down`, `task k8s:port-forward`.
 4. **Validación:** carga con `loadgen` → KEDA añade vLLM falsos → la plataforma los registra; se quita la carga → KEDA reduce → la plataforma drena sin errores; el dashboard lo muestra.
-5. **Documentación:** resultados aquí, en el README y en el análisis final (15).
+5. **Documentación:** resultados, README y análisis final.
 
 ---
 
@@ -124,65 +124,7 @@ Fuera: operador propio (sustituido por KEDA), varias réplicas (FI-2), Ingress y
 
 ## Resultados de la validación
 
-**Entorno:** minikube (Kubernetes 1.37, driver docker) en un portátil Windows, perfil `llm-platform` con 6 CPU y 10 GB; KEDA 2.21.1 instalado con Helm; vLLM falsos con 16 384 tokens de presupuesto cada uno. Acceso con `kubectl port-forward`. **Todo es vLLM falso:** las cifras validan el mecanismo (descubrimiento, escalado, drenaje), no el rendimiento.
-
-### Despliegue y FI-10
-
-`task k8s:up` levanta el clúster, carga las imágenes, instala KEDA y el chart. La plataforma registra el primer vLLM falso a los pocos milisegundos de arrancar (`vllm dns: new server` → `vllm registered`). Prometheus descubre la plataforma y los motores (`job="vllm"` por `dns_sd_configs`), y Grafana carga el mismo dashboard que el stack de Docker.
-
-| Petición | Puerto público (Service `platform`) | Puerto de administración (`platform-admin`) |
-| :--- | :--- | :--- |
-| `/healthz`, `/v1/*` | `200` | — |
-| `/debug/workers`, `/metrics` | **`404`** | `200` |
-
-### Prueba 1: sobrecarga, escalado de 1 a 4 y vuelta a 1
-
-`loadgen -rate 4 -duration 180s -prefixes 8` (725 peticiones; la demanda supera a propósito la capacidad de 4 réplicas):
-
-| Segundo | Pods listos | Demanda (tokens) | Workers en la plataforma |
-| ---: | ---: | ---: | ---: |
-| 28 | 1 | 37 217 | 1 |
-| 57 | 1 de 4 | 55 934 | 4 |
-| 71 | 4 | 98 364 | 4 |
-| 71–198 | 4 (máximo) | 78 000–107 000 | 4 |
-| 209 | 4 | 25 130 (fin de la carga) | 4 |
-| 233 | 3 | 0 | 4 → 3 |
-| 257 | **1** | 0 | **1** |
-
-- **Subida:** de 1 a 4 réplicas en ~40 s desde que la demanda supera el umbral (sondeo de KEDA cada 10 s, arranque del pod y 5 s de "carga del modelo", y hasta 10 s de DNS).
-- **Bajada:** de 4 a 1 en ~50 s tras acabar la carga (estabilización de 30 s).
-- **Resultado:** 69,7 % `200`, 24,7 % `503` (`queue_full` y `queue_timeout`), 5,7 % canceladas por el cliente (deliberado). Los `503` son el *load shedding* de la Fase 2 haciendo su trabajo: con el máximo de 4 réplicas la demanda (~90 000 tokens) sigue por encima de la capacidad (65 536), y además el primer minuto lo sirve una sola réplica mientras llegan las demás.
-
-### Prueba 2: carga que el autoscaling sí cubre, y un pod borrado en mitad de streams
-
-`loadgen -rate 1.5 -duration 180s -prefixes 8` (271 peticiones) y, en el segundo 110, `kubectl delete pod` de un vLLM falso con streams en curso:
-
-| Resultado | Valor |
-| :--- | :--- |
-| `200` | **258 (95,2 %)** |
-| `503 queue_timeout` | 1 (0,4 %), en el primer minuto, antes de escalar |
-| Canceladas por el cliente | 12 (4,4 %, deliberado) |
-| **Errores dentro del stream** | **0** |
-| TTFT p50 / p99 | 151 ms / 3,9 s (incluye la espera en cola mientras escala) |
-| Peticiones reintentadas en otro worker | 8, todas con éxito |
-
-Qué pasó al borrar el pod (logs de la plataforma):
-
-1. El pod recibe `SIGTERM`, cierra su *listener* y termina sus streams.
-2. Durante ~10 s el pod aún está en la última respuesta de DNS que vio la plataforma: las peticiones nuevas que le tocan fallan **al conectar** (antes del primer token), se **reintentan en otro worker** (Fase 4) y el breaker lo aísla. El cliente no ve nada.
-3. Al desaparecer del DNS, la plataforma lo da de baja con drenaje (`worker draining` → `worker removed`).
-4. Mientras, KEDA reducía réplicas porque bajó la demanda: dos workers se dieron de baja con **un stream en curso cada uno** (`in_flight: 1`) y se eliminaron cuando ese stream terminó, sin cortarlo.
-
-**Conclusión:** las bajas de pods, sean del autoscaler o manuales, no producen errores visibles; el reintento antes del primer token absorbe la ventana en la que el DNS va por detrás.
-
-### Lo que la validación destapó
-
-| Hallazgo | Estado |
-| :--- | :--- |
-| El puerto 8081 está reservado en Windows (rango excluido por Hyper-V): `port-forward` falla al usarlo en local. | **Corregido:** el puerto de administración se reenvía a `localhost:18081`. Dentro del clúster sigue siendo el 8081. |
-| `loadgen` pedía `/debug/*` al puerto público, que ahora responde `404`. | **Corregido:** flag `-admin-url`. |
-| Ventana de hasta 10 s en la que un pod que se apaga sigue en el DNS de la plataforma: sus conexiones fallan y abren el breaker. | **Aceptado:** el reintento lo hace invisible (8 reintentos, 0 errores). Se podría eliminar haciendo que el pod siga aceptando conexiones unos segundos tras el `SIGTERM` (el patrón habitual de *deregistration delay*, o un `preStop`), pero añade espera a cada baja y con vLLM real habría que comprobar cómo se comporta. |
-| La estrategia `Recreate` de la plataforma deja **unos segundos sin servicio** en cada `helm upgrade` o `rollout restart` (el pod viejo termina antes de que arranque el nuevo). | **Aceptado:** es el precio de FI-2, buscado a propósito (decisión 7). |
+En minikube: el autoscaling pasa de 1 a 4 vLLM falsos en ~40 s y vuelve a 1 en ~50 s; con carga que el autoscaling cubre, 95 % `200` y **0 errores dentro del stream**, también al borrar un pod con streams en curso; `/metrics` y `/debug` dan `404` en el Service público. Montaje, tablas y lo que destapó la validación en [resultados](../operaciones/04-resultados-de-pruebas.md#fase-7-kubernetes-en-minikube).
 
 ## Qué sí y qué no
 
@@ -194,5 +136,5 @@ Qué pasó al borrar el pod (logs de la plataforma):
 | Bajas sin errores visibles para el cliente | Ventana de DNS eliminada (se cubre con reintentos) |
 | Puerto de administración separado (FI-10) | Autenticación en ese puerto; Ingress y TLS |
 | Una réplica con `Recreate` (FI-2 explícito) | Alta disponibilidad del control plane |
-| vLLM en CPU en el chart, desactivado por defecto (se renderiza y pasa `helm lint`) | Arrancarlo en minikube (~6 GB de imagen): vLLM en CPU se validó en Docker en la 6b-CPU |
+| vLLM en CPU en el chart, desactivado por defecto (se renderiza y pasa `helm lint`) | Arrancarlo en minikube (pide ~6 GB de memoria): vLLM en CPU se validó en Docker en la 6b-CPU |
 | CI con tests, carreras y `helm lint` | Despliegue continuo, imágenes publicadas en un registro |

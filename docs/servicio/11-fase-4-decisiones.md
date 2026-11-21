@@ -1,6 +1,6 @@
-# 10. Fase 4: resiliencia y ciclo de vida — decisiones de diseño
+# 11. Fase 4: resiliencia y ciclo de vida — decisiones de diseño
 
-Este documento recoge las decisiones de diseño de la Fase 4 (salud de los workers, *circuit breakers*, reintentos y alta y baja de workers en caliente), con sus alternativas y la opción elegida. Como en la [Fase 2](08-fase-2-decisiones.md), es el registro del *por qué*; cómo quedó el código está en los documentos 1–7 y en [Implementación](#implementación-2026-11-18).
+Este documento recoge las decisiones de diseño de la Fase 4 (salud de los workers, *circuit breakers*, reintentos y alta y baja de workers en caliente), con sus alternativas y la opción elegida. Como en la [Fase 2](09-fase-2-decisiones.md), es el registro del *por qué*; cómo quedó el código está en los documentos 1–7 y en [Implementación](#implementación-2026-11-18).
 
 > **Estado (2026-11-18):** las siete decisiones y los cuatro conflictos están **aprobados con la opción recomendada** e **implementados**. Al implementar se corrigió un detalle de la decisión 3 (la mediana de la ITL excluye al propio worker, ver [Implementación](#decisiones-de-implementación-tomadas-por-el-camino)).
 
@@ -211,7 +211,7 @@ Estos valores son para el simulador. Se calibrarán con vLLM en la Fase 6.
 
 ## Implementación (2026-11-18)
 
-Las siete decisiones están implementadas. Detalle del código en [01](01-arquitectura.md), [02](02-recorrido-de-una-peticion.md), [03](03-leases-y-capacidad.md), [04](04-worker-simulado.md), [05](05-api-http.md) y [07](07-concurrencia-y-tests.md).
+Las siete decisiones están implementadas. Detalle del código en [01](01-arquitectura.md), [02](02-recorrido-de-una-peticion.md), [03](03-leases-y-capacidad.md), [04](04-worker-simulado.md), [05](05-api-http.md) y [tests](../operaciones/02-tests.md).
 
 | Decisión | Dónde | Cómo quedó |
 | :--- | :--- | :--- |
@@ -221,7 +221,7 @@ Las siete decisiones están implementadas. Detalle del código en [01](01-arquit
 | 4. Reintentos | `scheduler/lease.go`, `httpapi` | El `Lease` que devuelve `Acquire` es un decorador (`managedLease`) que reintenta **dentro de su propio `ExecuteStream`**. `httpapi` solo retrasa las cabeceras al primer chunk y responde con un código real si el stream falla antes. |
 | 5. Errores | `inference.ErrWorkerFailure`, `ErrNoHealthyWorkers` | `simworker` envuelve sus fallos con `ErrWorkerFailure`. Los cuelgues los clasifica el decorador. |
 | 6. Fallos simulados | `simworker/faults.go`, `admin.go` | `Config.Faults`, `SetFaults`, `Restart`. Endpoints `POST /debug/workers/{id}/faults` y `/restart`. |
-| 7. Tests y métricas | `*_test.go`, `/debug/*`, `cmd/loadgen -chaos` | Ver [07](07-concurrencia-y-tests.md). Contadores nuevos en `/debug/scheduler` y `status` por worker en `/debug/workers`. |
+| 7. Tests y métricas | `*_test.go`, `/debug/*`, `cmd/loadgen -chaos` | Ver [tests](../operaciones/02-tests.md). Contadores nuevos en `/debug/scheduler` y `status` por worker en `/debug/workers`. |
 
 ### Decisiones de implementación tomadas por el camino
 
@@ -239,26 +239,7 @@ Las siete decisiones están implementadas. Detalle del código en [01](01-arquit
 
 ### Mediciones con `loadgen -chaos`
 
-Tres workers con los valores por defecto del binario, `-ttft-timeout 2s`, 4 req/s durante 45 s (10 % de peticiones RAG, sin cancelaciones). `sim-worker-1` se rompe entre los segundos 15 y 30:
-
-```bash
-task run -- -ttft-timeout 2s                     # añadir -max-retries -1 para comparar sin reintentos
-task loadgen -- -rate 4 -duration 45s -cancel-fraction 0 -chaos down   # o -chaos hang
-```
-
-| Fallo | Reintentos | `200` | `503 worker_unavailable` | Fallos del worker | Reintentos (con éxito) | TTFT p99 |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| Caído (`down`) | 1 (por defecto) | **181 (100 %)** | 0 | 9 | 9 (9) | 132 ms |
-| | ninguno | 177 (97,8 %) | 4 | 4 | 0 | 157 ms |
-| Colgado (`hang`) | 1 (por defecto) | **181 (100 %)** | 0 | 10 (todos por TTFT) | 10 (10) | 2,18 s |
-| | ninguno | 171 (94,5 %) | 10 | 10 | 0 | 132 ms |
-
-Lectura:
-
-- **Con reintentos el cliente no ve ninguno de los fallos.** Cada petición que cayó en el worker roto antes del primer token se completó en otro.
-- **Caído:** los healthchecks lo detectan en ~6 s (3 fallos cada 2 s) y abren el breaker; los fallos de antes (4–9) son los que absorben los reintentos.
-- **Colgado:** pasa los healthchecks, así que solo lo detecta el timeout de TTFT. Tras 5 cuelgues seguidos se abre el breaker; cada prueba en semiabierto vuelve a colgarse y lo reabre con el doble de espera. El coste está en la cola de latencia: las peticiones reintentadas esperaron el timeout entero (p99 de 2,18 s con `-ttft-timeout 2s`; con el valor por defecto de 10 s, el p99 sería de ~10 s).
-- En los cuatro casos el worker se recuperó solo al quitar el fallo: breaker cerrado y sano al terminar.
+Con un worker caído o colgado durante la prueba, los reintentos antes del primer token dejaron el 100 % de las peticiones en `200`; sin reintentos, entre un 2,2 % y un 5,5 % de `503`. Montaje, tabla y lectura en [resultados](../operaciones/04-resultados-de-pruebas.md#fase-4-fallos-con-loadgen--chaos-simulador).
 
 ### Limitaciones y trabajo futuro
 
@@ -268,3 +249,17 @@ Lectura:
 - **Los reintentos no tienen prioridad en la cola.** Si el pool está lleno, el reintento espera como una petición nueva.
 - **Las altas y bajas solo llegan por `/debug`.** El *watch* de Kubernetes es la Fase 7.
 - **Varias réplicas (FI-2):** cada réplica tendría su propio breaker y sus propios healthchecks. Es aceptable (la salud es una pista), pero multiplica las consultas a `/health`.
+
+---
+
+## Qué pasó después
+
+Este documento es el registro de la fase tal como se decidió; lo que anunciaba para fases posteriores se resolvió así (estado al cerrar el proyecto, 2026-11-21):
+
+| Lo que quedó dicho aquí | Qué pasó |
+| :--- | :--- |
+| Los valores por defecto (timeouts, breaker) se calibrarían con vLLM en la Fase 6; el `TTFTTimeout` de 10 s era conservador. | Con vLLM en CPU, un prefill frío de 2 000 tokens tarda ~30 s: hizo falta el flag `-ttft-timeout-per-token` y un perfil de CPU (6b-CPU, [14](14-fase-6b-cpu-decisiones.md)). La calibración para GPU queda pendiente: sin GPUs no hay cifras. |
+| Las altas y bajas solo llegaban por `/debug`; el *watch* de Kubernetes sería la Fase 7. | Los conectores de `-vllm` registran los servidores cuando están listos (6a), y en la Fase 7 el descubrimiento se hizo por el **DNS** de un Service *headless* (`-vllm-dns`), no con un *watch* de la API, para evitar `client-go` y permisos ([15](15-fase-7-decisiones.md)). |
+| La baja con drenaje era la base del *scale-down* sin cortar streams. | Validado en minikube (Fase 7): workers dados de baja por KEDA con streams en curso los terminaron sin cortes, y un pod borrado a mano no produjo errores visibles gracias al reintento antes del primer token. |
+| Breaker por fallos seguidos; pasar a una tasa en ventana si hacía falta. | Sin cambios. La 6b-CPU destapó otra limitación: el timeout de primer token no distingue un worker lento de uno colgado, y con prefills lentos concurrentes abrió el breaker de workers sanos (documentada). |
+| Los reintentos no tienen prioridad en la cola. | Sin cambios. |

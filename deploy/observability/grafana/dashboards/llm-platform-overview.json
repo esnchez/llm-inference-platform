@@ -1,7 +1,7 @@
 {
   "uid": "llm-platform-overview",
   "title": "LLM Platform · Overview",
-  "description": "Observabilidad de la plataforma (Fase 5). Guía: docs/servicio/12-observabilidad.md",
+  "description": "Observabilidad de la plataforma (Fase 5). Guía: docs/operaciones/03-observabilidad.md",
   "tags": [
     "llm-platform"
   ],

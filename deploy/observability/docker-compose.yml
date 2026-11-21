@@ -1,5 +1,5 @@
 # Local observability stack (Phase 5): the platform, Prometheus and Grafana.
-# Start it with `task stack:up`; docs/servicio/12-observabilidad.md explains
+# Start it with `task stack:up`; docs/operaciones/03-observabilidad.md explains
 # the metrics and how to read the dashboard.
 name: llm-platform
 

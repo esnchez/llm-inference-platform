@@ -261,7 +261,7 @@ El ID de cada worker vLLM es `vllm-<host:puerto>`. Mezclar simulados y reales en
 3. **vLLM falso:** `internal/vllm/fakevllm` a partir de respuestas reales documentadas.
 4. **Adaptador:** cliente, parser SSE, errores, descubrimiento y conector, salud con `/metrics`; tests de unidad, contrato e integración.
 5. **Binario y stack:** flags, `cmd/fakevllm`, imagen, perfil del compose, fila "Motor" del dashboard; validación con `loadgen` (incluido `-chaos` sobre un falso).
-6. **Documentación:** documentos 1–7, 12, README (roadmap 6a/6b, FI-3, FI-7, FI-8, FI-9).
+6. **Documentación:** documentos 1–7, la guía de observabilidad, README (roadmap 6a/6b, FI-3, FI-7, FI-8, FI-9).
 
 ## Lo que la 6b necesitará decidir
 
@@ -281,7 +281,7 @@ Para no perderlo: proveedor de GPU (AWS, RunPod u otro) y presupuesto; modelo (e
 | 6. Errores | `internal/vllm/errors.go` | La tabla de la decisión, con el cuerpo de error de vLLM en sus dos formas. |
 | 7. Salud y motor | `discover.go` (`Health`, `updateEngine`), `inference.EngineStats` | `/health` + `/metrics` en cada healthcheck; `InstanceID` por `process_start_time_seconds` o por un contador que baja; acierto de caché y ocupación real en el `Snapshot`. Métricas `llmplatform_worker_engine_*` y fila 6 del dashboard. |
 | 8. Configuración | `cmd/platform` | `-vllm`, `-vllm-api-key` (`$VLLM_API_KEY`), `-vllm-token-budget`. |
-| 9. Pruebas | `internal/vllm/fakevllm`, `cmd/fakevllm`, tests de `internal/vllm` | Ver [07](07-concurrencia-y-tests.md). La prueba con vLLM real en CPU queda para el arranque de la 6b. |
+| 9. Pruebas | `internal/vllm/fakevllm`, `cmd/fakevllm`, tests de `internal/vllm` | Ver [tests](../operaciones/02-tests.md). La prueba con vLLM real en CPU queda para el arranque de la 6b. |
 | 10. Empaquetado | `platform/Dockerfile` (`ARG CMD`), `docker-compose.fake-vllm.yml`, `prometheus-fake-vllm.yml` | Una imagen por comando; `task stack:up:fake-vllm` levanta la plataforma con `-workers 0 -vllm …` y tres vLLM falsos en `:8001–8003`, que Prometheus también lee (`job="vllm"`). |
 | 11. Alcance | — | Como se decidió, con la corrección de `response_format`. |
 
@@ -301,11 +301,23 @@ Para no perderlo: proveedor de GPU (AWS, RunPod u otro) y presupuesto; modelo (e
 
 ### Validación
 
-- Tests: batería de contrato contra el adaptador (red real a un `httptest.Server`), unidad (parser SSE, errores, cuerpo de la petición, `/metrics`), integración (parámetros reenviados, `usage`, errores, cancelación que **aborta en el motor**, reinicios con y sin `process_start_time_seconds`, conector que espera a que cargue el modelo, extremo a extremo con reintento) y **estrés con caos sobre la red**: 400 peticiones contra 3 vLLM falsos que fallan, se cuelgan, cortan el stream, emiten errores, se reinician y dejan de estar sanos, sin fugas ni sobrecargas del ledger. `-race -count=5` en Go 1.23.
-- Stack `task stack:up:fake-vllm`: los tres falsos se registraron solos al terminar de "cargar" (~15 s), con presupuesto descubierto (1024 × 16 = 16 384 tokens) y `max_model_len` 8192; Prometheus lee el `/metrics` de la plataforma y el de los motores; `loadgen` con 24 prompts compartidos y un falso colgado 30 s; cada consulta del dashboard, incluida la fila 6, devolvió datos.
+Batería de contrato, integración y estrés con caos por la red (400 peticiones contra 3 vLLM falsos que fallan), y el stack con vLLM falsos: ver [resultados](../operaciones/04-resultados-de-pruebas.md#fase-6a-validación-con-el-vllm-falso) y la [suite de tests](../operaciones/02-tests.md).
 
 ### Lo que el falso no puede decir (pendiente de la 6b)
 
 - **Los formatos son supuestos.** El SSE, los cuerpos de error, `/v1/models` y los nombres de métricas se escribieron a partir del comportamiento documentado de vLLM, no de capturas de una versión concreta. Lo primero de la 6b es fijar la versión y contrastarlos (o hacer la prueba de humo en CPU).
 - **Las magnitudes del motor son inventadas.** En el falso, la ocupación de KV-Cache es `peticiones × 256 tokens`, su tokenizer es `3 + caracteres / 4` por mensaje y su caché de prefijos solo mira el primer mensaje. El stack mostró el ledger al 99,5 % frente a una KV-Cache "real" del 14 % y una estimación de tokens al 95 %: **el camino de los datos funciona, los números no significan nada** hasta medir vLLM.
 - **La detección de longitud excesiva** se basa en el texto del mensaje de vLLM (`maximum context length`…); con C3 casi ninguna petición demasiado larga debería llegar al motor.
+
+---
+
+## Qué pasó después
+
+Este documento es el registro de la fase tal como se decidió; lo que anunciaba para fases posteriores se resolvió así (estado al cerrar el proyecto, 2026-11-21):
+
+| Lo que quedó dicho aquí | Qué pasó |
+| :--- | :--- |
+| Lo que la 6b necesitaría decidir: proveedor de GPU, modelo, versión de vLLM, benchmark. | La 6b con GPUs **no se hizo**: se sustituyó por la 6b-CPU ([14](14-fase-6b-cpu-decisiones.md)), con vLLM 0.34 fijado, `Qwen2.5-0.5B-Instruct` y `loadgen` como herramienta de benchmark. |
+| Lo que el falso no puede decir: los formatos eran supuestos y las magnitudes inventadas. | Los formatos se **confirmaron** con vLLM real (SSE, `usage`, errores, `/v1/models`, nombres de métricas), con las respuestas reales guardadas como *fixtures*. La 6b-CPU encontró seis diferencias, todas corregidas o documentadas. Las magnitudes (FI-1, FI-3, FI-6) se midieron con el motor real. |
+| La heurística de `maximum context length` se verificaría en la 6b. | Verificada contra los errores reales capturados de vLLM 0.34 (`TestCapturedErrors`). |
+| El `Connector` registra cada URL de `-vllm`. | La Fase 7 lo reutilizó tal cual: el `DNSWatcher` arranca un `Connector` por IP y lo para cuando la IP sale del DNS, dando de baja (con drenaje) su worker. |

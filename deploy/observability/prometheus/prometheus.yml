@@ -5,7 +5,7 @@ global:
   evaluation_interval: 15s
 
 rule_files:
-  # The example alerts of docs/servicio/12-observabilidad.md. There is no
+  # The example alerts of docs/operaciones/03-observabilidad.md. There is no
   # Alertmanager: they are evaluated and shown at http://localhost:9090/alerts
   # but notify nobody.
   - /etc/prometheus/alerts.yml

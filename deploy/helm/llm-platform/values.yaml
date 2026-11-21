@@ -44,7 +44,7 @@ autoscaling:
   # the demo; production would keep minutes to avoid flapping.
   scaleDownStabilizationSeconds: 30
 
-# vLLM on CPU (Phase 6b-CPU): off by default (~6 GB image, ~6 min warm-up).
+# vLLM on CPU (Phase 6b-CPU): off by default (1.8 GB image, ~6 GB of memory, ~6 min warm-up).
 # Not autoscaled. With it on, add the CPU profile to platform.extraArgs:
 #   ["-ttft-timeout","30s","-ttft-timeout-per-token","25ms","-stall-timeout","30s"]
 vllmCpu:

@@ -1,6 +1,6 @@
 // Package metrics exposes the platform's Prometheus metrics (Phase 5,
-// docs/servicio/11-fase-5-decisiones.md and the catalogue in
-// docs/servicio/12-observabilidad.md).
+// docs/servicio/12-fase-5-decisiones.md and the catalogue in
+// docs/operaciones/03-observabilidad.md).
 //
 // It is the only package, with cmd/platform, that imports Prometheus. Two
 // mechanisms, by kind of data (decision 2):

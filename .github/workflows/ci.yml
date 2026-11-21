@@ -1,6 +1,6 @@
 # Continuous integration: the same checks as `task check:all`, on every push
 # and pull request. TestRealVLLM skips itself (no VLLM_URL here); the vLLM
-# smoke test and the stacks stay manual (see docs/servicio/07).
+# smoke test and the stacks stay manual (see docs/operaciones/02-tests.md).
 name: ci
 
 on:

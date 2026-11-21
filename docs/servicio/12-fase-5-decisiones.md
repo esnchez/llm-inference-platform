@@ -1,6 +1,6 @@
-# 11. Fase 5: observabilidad — decisiones de diseño
+# 12. Fase 5: observabilidad — decisiones de diseño
 
-Este documento recoge las decisiones de diseño de la Fase 5 (métricas Prometheus, logs y dashboards de Grafana), con sus alternativas y la opción elegida. Como en las fases 2 y 4, es el registro del *por qué*. **Qué se mide, por qué y cómo leer los dashboards** está en la guía [12 · Observabilidad](12-observabilidad.md), que es la referencia de uso y concreta estas decisiones.
+Este documento recoge las decisiones de diseño de la Fase 5 (métricas Prometheus, logs y dashboards de Grafana), con sus alternativas y la opción elegida. Como en las fases 2 y 4, es el registro del *por qué*. **Qué se mide, por qué y cómo leer los dashboards** está en la guía [observabilidad · Observabilidad](../operaciones/03-observabilidad.md), que es la referencia de uso y concreta estas decisiones.
 
 > **Estado (2026-11-18):** las ocho decisiones y los tres conflictos están **aprobados con la opción recomendada** e **implementados**; ver [Implementación](#implementación-2026-11-18). La guía 12 es la referencia de lo implementado.
 
@@ -29,7 +29,7 @@ Lo que pide el roadmap: logs estructurados, métricas Prometheus (TTFT, ITL, rat
 | :--- | :--- | :--- | :--- |
 | 1 | Librería de métricas | `prometheus/client_golang`, primera dependencia externa del módulo | — |
 | 2 | Cómo se instrumenta | Interfaces de observación en `scheduler` y `httpapi`, implementadas en un paquete nuevo `internal/metrics`; el estado actual se lee al hacer el *scrape* | 1 |
-| 3 | Qué se mide | Catálogo de la guía 12: señales de petición, admisión, capacidad, routing por prefijos y salud, con dos vistas del TTFT (cliente y worker) | 2, C1 |
+| 3 | Qué se mide | Catálogo de la guía de observabilidad: señales de petición, admisión, capacidad, routing por prefijos y salud, con dos vistas del TTFT (cliente y worker) | 2, C1 |
 | 4 | Histogramas | *Buckets* explícitos alineados con los de vLLM | 3 |
 | 5 | Logs | Eventos de ciclo de vida desde el scheduler, log por petición ampliado, niveles definidos, `X-Request-Id` del cliente respetado | — |
 | 6 | `/debug` | Se mantiene como está (depuración y `loadgen`) | — |
@@ -63,11 +63,11 @@ La dependencia queda confinada al paquete `internal/metrics` y a `cmd/platform` 
 | **Interfaces de observación + collector** | El núcleo no conoce Prometheus; patrón ya usado en el proyecto ("la interfaz la define quien la consume"); se puede probar con un observador falso | Una interfaz y un paquete más. |
 | Solo collector (leer contadores al hacer *scrape*) | Cero cambios en el núcleo | No sirve para histogramas: necesitan cada observación, no un acumulado. |
 
-Los eventos que necesita el scheduler (ver la guía 12 para el detalle): salida de la cola (admitida, timeout o cancelada, con su espera), colocación (afinidad, desbordamiento o por carga, y bloques acertados), fin de cada stream en un worker (TTFT del worker, ITL por token, resultado), reintento, transición del breaker, cambio de salud y reinicio detectado.
+Los eventos que necesita el scheduler (ver la guía de observabilidad para el detalle): salida de la cola (admitida, timeout o cancelada, con su espera), colocación (afinidad, desbordamiento o por carga, y bloques acertados), fin de cada stream en un worker (TTFT del worker, ITL por token, resultado), reintento, transición del breaker, cambio de salud y reinicio detectado.
 
 ## Decisión 3: qué se mide
 
-**Recomendación:** el catálogo de la guía [12](12-observabilidad.md#catálogo-de-métricas), organizado en cinco áreas que responden a cinco preguntas:
+**Recomendación:** el catálogo de la guía [observabilidad](../operaciones/03-observabilidad.md#catálogo-de-métricas), organizado en cinco áreas que responden a cinco preguntas:
 
 | Área | Pregunta |
 | :--- | :--- |
@@ -86,7 +86,7 @@ Puntos clave:
 
 ## Decisión 4: histogramas
 
-**Recomendación:** histogramas clásicos con ***buckets* explícitos**, alineados con los de vLLM en el rango útil (la guía 12 los lista), para comparar percentiles entre el control plane y el motor en la Fase 6.
+**Recomendación:** histogramas clásicos con ***buckets* explícitos**, alineados con los de vLLM en el rango útil (la guía de observabilidad los lista), para comparar percentiles entre el control plane y el motor en la Fase 6.
 
 | Opción | A favor | En contra |
 | :--- | :--- | :--- |
@@ -129,8 +129,8 @@ Puntos clave:
 | Tema | Propuesta | Por qué |
 | :--- | :--- | :--- |
 | Trazas distribuidas (OpenTelemetry) | Fuera | Con un solo proceso, el recorrido de una petición ya se ve en su log. Tendrá sentido cuando el adaptador hable con vLLM por red (Fase 6). |
-| Alertas activas (Alertmanager) | Fuera; **reglas de ejemplo documentadas** en la guía 12 | No hay a quién avisar en local, pero escribir las reglas fija qué consideramos un problema. |
-| SLO | Propuesta de SLI y objetivos en la guía 12 | Define qué `503` cuentan como fallo y cuáles son protección de carga. |
+| Alertas activas (Alertmanager) | Fuera; **reglas de ejemplo documentadas** en la guía de observabilidad | No hay a quién avisar en local, pero escribir las reglas fija qué consideramos un problema. |
+| SLO | Propuesta de SLI y objetivos en la guía de observabilidad | Define qué `503` cuentan como fallo y cuáles son protección de carga. |
 | Almacenamiento a largo plazo, Loki | Fuera | Local y efímero. |
 | Métricas de vLLM | Fuera hasta la Fase 6 | La guía ya muestra la correspondencia, para que el dashboard pueda añadir sus paneles. |
 
@@ -139,7 +139,7 @@ Puntos clave:
 1. **Métricas:** dependencia `client_golang`, paquete `internal/metrics`, interfaces de observación en `scheduler` y `httpapi`, *collector* de estado, `GET /metrics`. Tests del catálogo (cada métrica existe con sus etiquetas) y de los eventos (un observador falso).
 2. **Logs:** `Config.Logger` en el scheduler con los eventos de ciclo de vida, log por petición ampliado, `X-Request-Id` del cliente.
 3. **Stack:** Dockerfile, `docker-compose`, aprovisionamiento de Prometheus y Grafana, dashboard JSON, tareas de Task.
-4. **Validación:** `loadgen` con prefijos y con `-chaos` contra el stack; comprobar que cada panel cuenta lo que dice la guía; capturas y ajustes; actualizar los documentos 1–7, la guía 12 y el README.
+4. **Validación:** `loadgen` con prefijos y con `-chaos` contra el stack; comprobar que cada panel cuenta lo que dice la guía; capturas y ajustes; actualizar los documentos 1–7, la guía de observabilidad y el README.
 
 ## Nueva limitación (registrada en el README raíz, §9)
 
@@ -153,8 +153,8 @@ Puntos clave:
 | :--- | :--- | :--- |
 | 1. Librería | `go.mod` | `github.com/prometheus/client_golang v1.23.2`. Es la última versión que declara `go 1.23` (la `v1.25.0` exige Go 1.26), así que el módulo sigue en su Go mínimo y los tests `-race` en `golang:1.23`. |
 | 2. Instrumentación | `scheduler/observe.go`, `httpapi/observe.go`, `internal/metrics` | `scheduler.Observer` (9 eventos) y `httpapi.Observer` (`RequestStarted`, `RequestFinished` con un `RequestRecord`); por defecto vacíos. `metrics.Metrics` los implementa; `Watch(sched)` registra el *collector* de estado. |
-| 3. Catálogo | `internal/metrics` | Las métricas de la guía 12, con los nombres, etiquetas y tipos que allí se listan. Un test comprueba que existen todas y pasa el *linter* de Prometheus (`testutil.GatherAndLint`). |
-| 4. Histogramas | `metrics.go` | *Buckets* de la guía 12. |
+| 3. Catálogo | `internal/metrics` | Las métricas de la guía de observabilidad, con los nombres, etiquetas y tipos que allí se listan. Un test comprueba que existen todas y pasa el *linter* de Prometheus (`testutil.GatherAndLint`). |
+| 4. Histogramas | `metrics.go` | *Buckets* de la guía de observabilidad. |
 | 5. Logs | `scheduler` (`Config.Logger`), `httpapi` | Eventos de ciclo de vida con `component=scheduler`; log por petición con `outcome`, `http_status`, `queue_wait_ms`, `retries`, `worker_ttft_ms`; niveles por `outcome`; `X-Request-Id` del cliente. |
 | 6. `/debug` | — | Sin cambios. |
 | 7. Stack | `platform/Dockerfile`, `deploy/observability/`, `Taskfile.yml` | Imagen multi-etapa (`golang:1.23` → `distroless/static:nonroot`); Prometheus `v3.5.0`, Grafana `12.1.0`; `task stack:up`, `stack:down`, `stack:logs`. |
@@ -175,5 +175,18 @@ Puntos clave:
 
 ### Validación
 
-- Tests: `internal/metrics` (catálogo, *lint*, valores, histogramas, cola, contadores a 0), eventos del scheduler con un observador falso y logs, resultados de cada camino de la API y `X-Request-Id`. Ver [07](07-concurrencia-y-tests.md).
-- Stack: `promtool check config` y `check rules`; *target* `UP`; dashboard y fuente de datos aprovisionados; **cada consulta del dashboard ejecutada contra Prometheus** tras una prueba con `loadgen`; revisión visual con una captura (ver el [ejemplo de lectura](12-observabilidad.md#ejemplo-de-lectura-un-worker-colgado)).
+Tests del catálogo y de los eventos, y validación del stack consulta a consulta contra Prometheus: ver [resultados](../operaciones/04-resultados-de-pruebas.md#fase-5-validación-del-stack-de-observabilidad) y la [suite de tests](../operaciones/02-tests.md).
+
+---
+
+## Qué pasó después
+
+Este documento es el registro de la fase tal como se decidió; lo que anunciaba para fases posteriores se resolvió así (estado al cerrar el proyecto, 2026-11-21):
+
+| Lo que quedó dicho aquí | Qué pasó |
+| :--- | :--- |
+| FI-10: `/metrics`, `/debug` y la administración en el puerto público (conflicto C2). | **Resuelta en la Fase 7** con `-admin-addr`: en Kubernetes, el Service público solo expone la API. El puerto de administración no tiene autenticación. |
+| Las métricas de vLLM quedaban para la Fase 6. | Hecho en la 6a: fila *6 · Motor (vLLM)* del dashboard y Prometheus leyendo el `/metrics` de los motores; verificado con vLLM real en la 6b-CPU. |
+| Las trazas tendrían sentido cuando el adaptador hablara con vLLM por red. | Siguen fuera: el log por petición (con `worker_id`, `queue_wait_ms`, `retries`, `worker_ttft_ms`) bastó para todas las pruebas. Están en la lista de lo que falta para producción ([análisis final](../analisis-final.md#distancia-a-producción-con-gpus)). |
+| *Buckets* de los histogramas alineados con los de vLLM. | En CPU, el TTFT p90 superó el último *bucket* (40 s); se aceptó porque en GPU no hace falta (6b-CPU). |
+| Stack local con Docker Compose. | El mismo dashboard y las mismas alertas se despliegan también en Kubernetes con el chart de Helm (Fase 7), sin copias: se pasan con `--set-file`. |

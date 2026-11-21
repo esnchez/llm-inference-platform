@@ -1,56 +1,8 @@
-# 7. Concurrencia y tests
+# 2. Tests
 
-## Modelo de concurrencia
+Qué cubre la suite de tests, cómo se ejecuta y qué huecos tiene. El modelo de concurrencia que estos tests protegen está en [servicio · 07](../servicio/07-concurrencia.md); los resultados de las pruebas de carga, en [resultados](04-resultados-de-pruebas.md).
 
-### Goroutines por petición
-
-| Goroutine | Quién la crea | Qué hace | Cuándo termina |
-| :--- | :--- | :--- | :--- |
-| Handler | `net/http` (una por petición) | Admisión, escritura SSE, log | Cuando acaba el stream o el cliente se va |
-| Productor | `inference.StartStream` | Ejecuta `lease.ExecuteStream` y cierra el canal | Cuando `ExecuteStream` retorna |
-| TTL | `time.AfterFunc` (solo si vence) | Llama a `lease.expire()` | Inmediatamente |
-| Dispatcher | `scheduler.New` (una por proceso) | Escucha `CapacityChanged()` de todos los workers, las llegadas y el sondeo; entrega leases a las peticiones en cola | `Scheduler.Close()` |
-
-```mermaid
-flowchart LR
-    subgraph Handler["goroutine del handler"]
-        H["for c := range chunks<br/>→ writeSSE + Flush"]
-    end
-    subgraph Prod["goroutine de StartStream"]
-        E["lease.ExecuteStream(ctx, out)"]
-    end
-    E -- "out (buffer 16)" --> H
-    E -- "errc (buffer 1)" --> W["wait()"]
-    H -. "cancel() si falla la escritura" .-> CTX(("ctx"))
-    Cliente -. "desconexión" .-> CTX
-    CTX -. "ctx.Done()" .-> E
-```
-
-Reglas que evitan bloqueos y fugas de goroutines:
-
-- **Solo el productor escribe en `out` y solo él lo cierra** (con `defer close(out)` en `StartStream`). `ExecuteStream` nunca lo cierra.
-- **`errc` tiene buffer 1**: el productor puede dejar su error y terminar aunque nadie llame a `wait()`.
-- **El productor nunca se bloquea para siempre**: toda espera y todo envío están en un `select` con `ctx.Done()`.
-- **El handler siempre vacía el canal** hasta que se cierra, incluso después de fallar una escritura, para que el productor termine.
-- **El dispatcher entrega cada lease por un canal con buffer 1** y marca la petición como servida bajo `Scheduler.mu`. Si la petición se rinde a la vez (cliente que se va o timeout), lo ve bajo el mismo lock y libera (o usa) ese lease: nunca se pierde capacidad.
-
-### Estado compartido y locks
-
-| Estado | Protección | Notas |
-| :--- | :--- | :--- |
-| `Worker.reserved`, `active`, `granted`, `rejected` | `Worker.mu` | Solo aritmética bajo el lock; nunca E/S ni esperas. |
-| Estado del lease (`state`, `executed`, `expired`) | `lease.mu` | Serializa `begin`, `Release` y `expire`. |
-| Colas, contadores y estadísticas del scheduler | `Scheduler.mu` | Se mantiene mientras se intentan leases (`Worker.mu` se toma dentro, nunca al revés). |
-| Desplazamiento de `RoundRobin` | `atomic.Uint64` | Sin lock. |
-| Lista de workers, colas por modelo y configuración | Inmutables tras la creación | Se leen sin lock. |
-
-**Orden de locks:** `lease.mu` y `Worker.mu` nunca se mantienen a la vez (`Release()` y `expire()` sueltan `lease.mu` antes de llamar a `w.free()`). El único anidamiento es `Scheduler.mu` → `Worker.mu` (la cola se recorre bloqueada mientras se intentan leases); el worker nunca toma `Scheduler.mu`, solo avisa por un canal con envío no bloqueante. Con un único orden posible no hay riesgo de *deadlock*.
-
-### Lo que comprueba el detector de carreras
-
-`go test -race` instrumenta todos los accesos a memoria y falla si dos goroutines acceden al mismo dato sin sincronización y al menos una escribe. La suite se ejecuta con `-race -count=5` en Linux (`task test:race`) y pasa sin incidencias.
-
-## La suite de tests
+## Tareas
 
 Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta dentro de `platform/` (ver §8 del README raíz):
 
@@ -58,21 +10,24 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | :--- | :--- |
 | `task check` | En cada cambio: `gofmt` + `go vet` + tests. |
 | `task check:all` | Antes de cerrar una fase: `check` + tests con `-race` en Docker. |
-| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %; al cerrar la Fase 5: `metrics` 97 %, `scheduler` 94 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 92 %; al cerrar la Fase 6a: `httpapi` 93 %, `metrics` 94 %, `scheduler` 94 %, `simworker` 94 %, `vllm` 88 %, y `ledger` 98 % / `fakevllm` 83 % medidos con `-coverpkg`, porque los ejercitan los tests de otros paquetes). |
+| `task test:race` | `go test -race -count=5` en un contenedor `golang:1.23` (el Go mínimo del módulo); `test:race:local` lo hace en el host (requiere cgo). |
+| `task vllm-cpu:smoke` | La prueba de humo contra vLLM real en CPU (`TestRealVLLM`); necesita `task vllm-cpu:up` antes. |
+| `task test:cover` | Cobertura por función (77 % al cerrar la Fase 1; 82 % al cerrar la Fase 2; al cerrar la Fase 3: `prefix` 93 %, `scheduler` 93 %, `simworker` 97 %, `httpapi` 87 %; al cerrar la Fase 4: `scheduler` 95 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 90 %; al cerrar la Fase 5: `metrics` 97 %, `scheduler` 94 %, `simworker` 94,5 %, `prefix` 93 %, `httpapi` 92 %; al cerrar la Fase 6a: `httpapi` 93 %, `metrics` 94 %, `scheduler` 94 %, `simworker` 94 %, `vllm` 88 %, y `ledger` 98 % / `fakevllm` 83 % medidos con `-coverpkg`, porque los ejercitan los tests de otros paquetes; al cerrar la Fase 7: `tokens` 100 %, `simworker` 94 %, `metrics` 94 %, `httpapi` 94 %, `scheduler` 94 %, `prefix` 93 %, `vllm` 88 %). |
 | `task loadgen` | Generador de carga contra un servidor en marcha (no es un test: sirve para comparar configuraciones). |
 | CI (`.github/workflows/ci.yml`) | En cada *push* y *pull request*: `gofmt`, `go vet`, `go test -race -count=2` en Go 1.23 y `helm lint` del chart. |
 
-### Batería de contrato común (`internal/workertest`, Fase 6a)
+## Batería de contrato común (`internal/workertest`, Fase 6a)
 
 `workertest.Run` se ejecuta contra **cada implementación de `Worker`**: el simulador (`simworker/contract_test.go`) y el adaptador de vLLM contra un vLLM falso por HTTP (`vllm/integration_test.go`). Subtests: admisión (reserva, encaje exacto, `ErrAtCapacity`, `ErrRequestTooLarge`, `ErrModelNotServed`, `ErrInvalidRequest`, contexto cancelado, `Release` idempotente), stream completo que libera capacidad, lease de un solo uso, cancelación que libera al instante, TTL sin doble liberación, señal `CapacityChanged` y 60 adquisiciones concurrentes sin superar el presupuesto. `workertest.Stub` da un worker mínimo sobre el ledger para tests que necesitan `usage` o `max_model_len`.
 
-`internal/ledger`: validación de la configuración y `MaxRequestTokens` (una petición que cabe en el presupuesto pero no en `max_model_len`).
+`internal/ledger`: `TestNewValidates` (configuración inválida) y `TestMaxRequestTokens` (una petición que cabe en el presupuesto pero no en `max_model_len` da `ErrRequestTooLarge`). El resto del ledger lo ejercita la batería de contrato.
 
-### `internal/simworker` — contrato del lease
+## `internal/simworker` — contrato del lease
 
 | Test | Qué garantiza |
 | :--- | :--- |
 | `TestNewValidatesConfig` | Configuraciones inválidas se rechazan. |
+| `TestNewRejectsNegativeRealismKnobs` | `MeanOutputTokens`, `ITLLoadFactor` y `PrefixCacheBlocks` negativos se rechazan. |
 | `TestAcquireLeaseAdmission` | Reserva, encaje exacto, `ErrAtCapacity`, `ErrRequestTooLarge`, `ErrModelNotServed`, `ErrInvalidRequest`, `Release` idempotente y contadores. |
 | `TestAcquireLeaseCancelledContext` | No se reserva con un contexto ya cancelado. |
 | `TestExecuteStreamEmitsAllTokens` | Número, orden y `finish_reason` de los chunks; capacidad liberada al terminar. |
@@ -99,7 +54,7 @@ Todo está en `Taskfile.yml`, en la raíz del repositorio; cada tarea se ejecuta
 | `TestRestartCutsStreamsAndChangesInstance` | `Restart` corta los streams, libera su capacidad, vacía la caché y cambia el `InstanceID`. |
 | `TestHealthHonoursContext` | `Health` respeta un contexto cancelado. |
 
-### `internal/scheduler` — admisión, cola y colocación
+## `internal/scheduler` — admisión, cola y colocación
 
 Los tests usan un sondeo de seguridad de 1 hora, así que demuestran que es la señal `CapacityChanged()` (y no el sondeo) la que despierta al dispatcher.
 
@@ -160,7 +115,7 @@ Los tests usan un sondeo de seguridad de 1 hora, así que demuestran que es la s
 
 `TestStressInvariants` tiene además un subtest `chaos`: las mismas 1.500 peticiones mientras una goroutine cambia los fallos de los workers al azar cada 3 ms (errores, caída, cuelgue, corte, parada, lentitud y reinicios), con healthchecks, breaker y reintentos activos. Comprueba las mismas invariantes (presupuesto nunca superado, un resultado por petición, cola y ledgers vacíos, sin goroutines vivas) y además que no queda ningún grant sin terminar.
 
-### `internal/prefix` — hashes y radix tree
+## `internal/prefix` — hashes y radix tree
 
 | Test | Qué garantiza |
 | :--- | :--- |
@@ -174,7 +129,7 @@ Los tests usan un sondeo de seguridad de 1 hora, así que demuestran que es la s
 | `TestTreeRandomized` | 3.000 inserciones aleatorias con prefijos compartidos: invariantes del árbol, cota de capacidad por worker y coincidencia completa tras insertar. |
 | `TestTreeConcurrentUse` | 8 goroutines insertando y consultando a la vez (con `-race`). |
 
-### `internal/httpapi` — de extremo a extremo con `httptest`
+## `internal/httpapi` — de extremo a extremo con `httptest`
 
 Usan workers simulados reales detrás de un servidor HTTP real:
 
@@ -193,18 +148,18 @@ Usan workers simulados reales detrás de un servidor HTTP real:
 | `TestRequestOutcomes` | Cada camino acaba en su `outcome` (completada, modelo desconocido como `unknown`, JSON inválido, demasiado grande, worker caído, corte a mitad de stream con y sin streaming), con sus tokens y su TTFT. |
 | `TestClientRequestID` | Un `X-Request-Id` válido se usa como ID (cabecera y chunks); uno con espacios, demasiado largo o ausente se sustituye por uno generado. |
 
-### `internal/metrics` — catálogo y valores (Fase 5)
+## `internal/metrics` — catálogo y valores (Fase 5)
 
 Montan las piezas reales como `cmd/platform` (workers simulados, scheduler y API, todos informando a un `Metrics`):
 
 | Test | Qué garantiza |
 | :--- | :--- |
-| `TestCatalogue` | Con tráfico que toca todas las áreas, **cada métrica de la guía 12 existe**, pasa el *linter* de Prometheus (`GatherAndLint`) y tiene valores coherentes (las peticiones reintentadas cuentan como `completed`, el modelo desconocido como `unknown`, la concurrencia vuelve a 0); `/metrics` sirve el formato de texto. |
+| `TestCatalogue` | Con tráfico que toca todas las áreas, **cada métrica de la guía de observabilidad existe**, pasa el *linter* de Prometheus (`GatherAndLint`) y tiene valores coherentes (las peticiones reintentadas cuentan como `completed`, el modelo desconocido como `unknown`, la concurrencia vuelve a 0); `/metrics` sirve el formato de texto. |
 | `TestHistogramsObserveBothTTFTs` | Una petición da un TTFT del cliente, uno del worker, un hueco entre tokens por token y una latencia total. |
 | `TestQueueMetrics` | Una petición que espera da una admisión `queued` y una observación de espera en cola. |
 | `TestEventCountersStartAtZero` | Los contadores de eventos existen a 0 desde el primer *scrape*, para que `increase()` vea el primer evento. |
 
-### `internal/vllm` — el adaptador (Fase 6a)
+## `internal/vllm` — el adaptador (Fase 6a)
 
 | Test | Qué garantiza |
 | :--- | :--- |
@@ -233,14 +188,14 @@ En `internal/tokens`: `TestEstimate` (tabla de casos, caracteres frente a bytes)
 - `TestCapturedStream`, `TestCapturedErrors`, `TestCapturedDiscovery`: el parser SSE, la tabla de errores, el descubrimiento y la lectura de `/metrics` contra **respuestas reales de vLLM 0.34** guardadas en `internal/vllm/testdata/vllm-0.34.0/` (bloques de 128, 682 bloques, 87 296 tokens).
 - `TestRealVLLM`: la prueba de humo contra un vLLM en marcha; solo se ejecuta si `VLLM_URL` está definida (`task vllm-cpu:up` y `task vllm-cpu:smoke`). Comprueba descubrimiento, `usage` real, `400` de prompt demasiado largo, el recorte de `max_tokens`, que cancelar detiene la generación (vía `num_requests_running`) y los nombres de las métricas (FI-4). Pasa contra `v0.34.0-x86_64` en CPU.
 
-### Huecos conocidos
+## Huecos conocidos
 
 - **El vLLM falso no se ha reajustado** a las capturas reales (por ejemplo, usa bloques de 16 por defecto y no recorta `max_tokens`). Los formatos coinciden y los tests del parser corren contra las capturas, que es lo que importa; el falso sirve para probar fallos, no para imitar magnitudes.
-- `TestRealVLLM` no entra en `task check`: tarda minutos en arrancar vLLM y necesita una imagen de 1,8 GB.
+- `TestRealVLLM` no entra en `task check` ni en la CI: tarda minutos en arrancar vLLM y necesita su imagen (1,8 GB).
 
-- El stack de observabilidad (Dockerfile, compose, dashboard) no tiene tests automáticos. Se validó al cerrar la Fase 5: `promtool check config`/`check rules`, cada consulta del dashboard contra Prometheus tras una prueba con `loadgen`, y revisión visual de una captura.
+- El stack de observabilidad (Dockerfile, compose, dashboard) no tiene tests automáticos. Se validó a mano en cada fase que lo tocó: en la 5 (`promtool check config`/`check rules`, cada consulta del dashboard contra Prometheus tras una prueba con `loadgen`, revisión visual de una captura), en la 6a (con vLLM falsos), en la 6b-CPU (con vLLM real) y en la 7 (el mismo dashboard en Kubernetes).
 
-- El chart de Helm solo tiene `helm lint` automático (en la CI); el despliegue, el autoscaling y el apagado ordenado del vLLM falso se validaron en minikube ([16](16-fase-7-decisiones.md#resultados-de-la-validación)).
+- El chart de Helm solo tiene `helm lint` automático (en la CI); el despliegue, el autoscaling y el apagado ordenado del vLLM falso se validaron en minikube ([resultados](04-resultados-de-pruebas.md#fase-7-kubernetes-en-minikube)).
 - La comparación de colocaciones (TTFT, acierto de caché) se mide con `loadgen` contra el binario, no con un test: depende de tiempos reales.
 - Los endpoints de administración de `cmd/platform` no tienen tests automáticos: se probaron a mano contra el binario (alta, fallos, campo desconocido, baja con drenaje, reinicio).
 - La comprobación del pico de reserva sigue siendo por muestreo (después de cada concesión), tanto en `simworker` como en el test de estrés del scheduler.
@@ -248,4 +203,4 @@ En `internal/tokens`: `TestEstimate` (tabla de casos, caracteres frente a bytes)
 - No hay un test que fuerce el vencimiento del TTL *después* de salir de la cola; el camino normal (cola → handler con TTL activo) sí está cubierto.
 - `task test:race` necesita Docker Desktop arrancado. Al cerrar la Fase 2 (2026-11-09) pasó con `-race -count=5`, tras corregir una carrera que encontró en el mensaje de `ErrQueueFull`. Al cerrar la Fase 3 (2026-11-17) pasó a la primera con `-race -count=5` en Go 1.23. Al cerrar la Fase 4 (2026-11-18) también, incluido el estrés con caos, y al cerrar la Fase 5 (2026-11-18) también, con `client_golang` incluido. Al cerrar la Fase 7 (2026-11-21) también, incluido el test del observador de DNS. Desde Git Bash, lanzar `docker` a mano requiere `MSYS_NO_PATHCONV=1` (Task no lo necesita).
 
-La estrategia de tests de la Fase 2 (contrato, estrés con invariantes y generador de carga) está en [08 · Decisión 7](08-fase-2-decisiones.md#decisión-7-tests-carga-y-métricas-mínimas).
+La estrategia de tests de la Fase 2 (contrato, estrés con invariantes y generador de carga) está en [09 · Decisión 7](../servicio/09-fase-2-decisiones.md#decisión-7-tests-carga-y-métricas-mínimas).

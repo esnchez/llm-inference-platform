@@ -2,7 +2,7 @@
 
 ## Un binario, dos planos
 
-Hoy todo corre en **un único proceso Go** (`cmd/platform`). Aun así, el código ya está separado según los dos planos de la arquitectura final, de forma que cada pieza pueda salir a su propio proceso (o ser sustituida por vLLM) sin tocar las demás:
+El control plane corre en **un único proceso Go** (`cmd/platform`), y el código está separado según los dos planos de la arquitectura, de forma que cada pieza pueda salir a su propio proceso o ser sustituida sin tocar las demás. Los workers pueden ser simulados (dentro del proceso) o servidores vLLM (fuera, por HTTP, desde la Fase 6a). El diagrama muestra el caso simulado:
 
 ```mermaid
 flowchart TB
@@ -33,7 +33,7 @@ flowchart TB
     api -- "ExecuteStream / Release<br/>(vía el Lease)" --> contract
 ```
 
-La frontera importante es el **contrato `inference`**: el control plane solo habla con interfaces (`Worker`, `Lease`), nunca con `simworker` directamente. En la Fase 6, un `VLLMAdapter` implementará esas mismas interfaces haciendo llamadas HTTP a un servidor vLLM, y el resto del código no cambiará.
+La frontera importante es el **contrato `inference`**: el control plane solo habla con interfaces (`Worker`, `Lease`), nunca con `simworker` directamente. En la Fase 6a, el `VLLMAdapter` (`internal/vllm`) implementó esas mismas interfaces con llamadas HTTP a un servidor vLLM, y el scheduler y la API no cambiaron.
 
 ## Paquetes
 
@@ -59,7 +59,7 @@ platform/
     └── metrics/           métricas Prometheus: implementa los observadores y lee el estado (Fase 5)
 ```
 
-El resto del repositorio (README, `docs/`, `Taskfile.yml`) queda fuera del módulo. Así, los componentes futuros (Helm charts, Dockerfiles, el operador de Kubernetes) pueden tener su propia carpeta junto a `platform/`.
+El resto del repositorio (README, `docs/`, `Taskfile.yml`, `deploy/` con los stacks de Docker y el chart de Helm, `.github/` con la CI) queda fuera del módulo. El `Dockerfile` está en `platform/` y construye cualquiera de los binarios (`ARG CMD`).
 
 Grafo de dependencias (las flechas son *imports*). No hay ciclos y `inference` no depende de nadie:
 
@@ -107,7 +107,7 @@ El detalle del contrato está en [03 · Leases y capacidad](03-leases-y-capacida
 - `Hashes(model, prompt)` corta el prompt en bloques de `BlockTokens` = 16 tokens estimados (64 caracteres) y devuelve un hash encadenado por bloque completo: el hash del bloque *i* identifica todo el prefijo hasta él.
 - `Tree` es un radix tree sobre esas secuencias que recuerda qué workers tienen qué prefijos, con una capacidad LRU por worker. Es la aproximación del router a las cachés reales de los workers.
 
-No depende del scheduler ni de los workers (solo de `tokens`), así que se prueba aislado. Ver [09 · Fase 3](09-fase-3-routing-por-prefijos.md).
+No depende del scheduler ni de los workers (solo de `tokens`), así que se prueba aislado. Ver [10 · Fase 3](10-fase-3-decisiones.md).
 
 ### `internal/ledger` — la contabilidad compartida (Fase 6a)
 
@@ -115,7 +115,7 @@ El presupuesto con su mutex, `Acquire` atómico, el lease con su máquina de est
 
 ### `internal/vllm` — el adaptador de vLLM (Fase 6a)
 
-Un `inference.Worker` sobre el ledger cuyo `Executor` llama a `POST /v1/chat/completions` de un servidor vLLM y traduce su stream SSE a `TokenChunk`. Un `Connector` por URL descubre el servidor (modelos, `max_model_len`, tamaño de la KV-Cache) y lo registra en el scheduler cuando está listo. Ver [06](06-relacion-con-vllm.md#el-vllmadapter-fase-6a) y [13](13-fase-6a-decisiones.md).
+Un `inference.Worker` sobre el ledger cuyo `Executor` llama a `POST /v1/chat/completions` de un servidor vLLM y traduce su stream SSE a `TokenChunk`. Un `Connector` por URL descubre el servidor (modelos, `max_model_len`, tamaño de la KV-Cache) y lo registra en el scheduler cuando está listo. Desde la Fase 7, un `DNSWatcher` resuelve un nombre (el Service *headless* de Kubernetes) cada 10 s, arranca un `Connector` por cada IP nueva y da de baja con drenaje las que desaparecen. Ver [06](06-relacion-con-vllm.md#el-vllmadapter-fase-6a) y [13](13-fase-6a-decisiones.md).
 
 ### `internal/simworker` — el data plane simulado
 
@@ -123,16 +123,16 @@ Implementa `Worker` y `Lease` con un presupuesto de tokens protegido por un mute
 
 ### `internal/scheduler` — admisión, colocación y ciclo de vida (Fases 2 a 4)
 
-Desde la Fase 2 el scheduler tiene dos mitades detrás de la misma `Acquire` ([08 · Decisión 3](08-fase-2-decisiones.md#decisión-3-separar-admisión-y-colocación)):
+Desde la Fase 2 el scheduler tiene dos mitades detrás de la misma `Acquire` ([09 · Decisión 3](09-fase-2-decisiones.md#decisión-3-separar-admisión-y-colocación)):
 
 | Pieza | Responde a | Implementación |
 | :--- | :--- | :--- |
 | **Admisión** (`scheduler.go`) | *Cuándo* puede intentar una petición | Una cola FIFO por modelo, límites, timeout y un dispatcher único. |
-| **Colocación** (`placement.go`, `affinity.go`) | *Dónde* se ejecuta | Interfaz `Placement`. `RoundRobin` (Fase 2): first-fit desde un desplazamiento rotatorio. `PrefixAffinity` (Fase 3, la que usa el binario): primero los workers que tienen el prefijo más largo y no están cargados, luego el resto del menos al más cargado. Ver [09](09-fase-3-routing-por-prefijos.md). |
+| **Colocación** (`placement.go`, `affinity.go`) | *Dónde* se ejecuta | Interfaz `Placement`. `RoundRobin` (Fase 2): first-fit desde un desplazamiento rotatorio. `PrefixAffinity` (Fase 3, la que usa el binario): primero los workers que tienen el prefijo más largo y no están cargados, luego el resto del menos al más cargado. Ver [10](10-fase-3-decisiones.md). |
 
 `Acquire(ctx, req)`:
 
-1. **Comprobaciones estáticas, sin esperar:** petición inválida → `ErrInvalidRequest` (400); ningún worker sirve el modelo → `ErrModelNotFound` (404); el coste supera el presupuesto del mayor worker del modelo → `ErrRequestTooLarge` (400).
+1. **Comprobaciones estáticas, sin esperar:** petición inválida → `ErrInvalidRequest` (400); ningún worker sirve el modelo → `ErrModelNotFound` (404); el coste supera el presupuesto del mayor worker del modelo, o el prompt no cabe en el `max_model_len` del motor → `ErrRequestTooLarge` (400). Con un motor real, un `max_tokens` que no cabe en el contexto se recorta antes (Fase 6b-CPU).
 2. **Camino rápido:** si la cola del modelo está vacía, la colocación intenta un lease y, si lo obtiene, la petición entra sin esperar. Si la cola no está vacía no lo intenta: nadie se cuela delante de quien ya espera.
 3. **Límites:** si la cola del modelo superaría `QueueTokenFactor` (2) × el presupuesto total de sus workers, o ya esperan `MaxQueuedRequests` (1024) peticiones en total → `ErrQueueFull` (503).
 4. **Espera:** la petición entra en la cola hasta que el dispatcher le entregue un lease, como mucho `min(QueueTimeout, deadline del cliente)`. Si vence → `ErrQueueTimeout` (503). Si el cliente se va, sale de la cola sin reservar nada; si el lease llegó justo a la vez, lo libera.
@@ -160,7 +160,7 @@ Los rechazos por cola van envueltos en `inference.RetryAfterError`, con un `Retr
 
 #### Ciclo de vida de los workers (Fase 4)
 
-Desde la Fase 4 el scheduler es también el **registro de workers** ([10](10-fase-4-decisiones.md)):
+Desde la Fase 4 el scheduler es también el **registro de workers** ([11](11-fase-4-decisiones.md)):
 
 | Pieza | Fichero | Qué hace |
 | :--- | :--- | :--- |
@@ -187,29 +187,31 @@ Traduce HTTP ⇄ contrato `inference`: valida el JSON, construye el `InferenceRe
 ### `cmd/platform` — el wiring
 
 1. Lee los flags (ver tabla abajo).
-2. Crea `-workers` instancias de `simworker.Worker` (`sim-worker-1..N`), todas sirviendo los mismos modelos y con el mismo presupuesto y caché de prefijos.
-3. Crea la colocación elegida con `-placement`, un `scheduler.Scheduler` (que arranca su dispatcher) y el `httpapi.Server`; al salir, `Close()` para el dispatcher.
-4. Arranca `http.Server` con `ReadHeaderTimeout: 10s` y **sin `WriteTimeout`** (un `WriteTimeout` cortaría cualquier stream SSE largo).
-5. Al recibir `SIGINT`/`SIGTERM` llama a `Shutdown` con `-shutdown-grace`: deja de aceptar conexiones y espera a que terminen los streams en curso. Si se agota la gracia, `Close()` corta las conexiones restantes; eso cancela sus contextos y, por tanto, libera sus leases.
+2. Crea `-workers` instancias de `simworker.Worker` (`sim-worker-1..N`), todas sirviendo los mismos modelos y con el mismo presupuesto y caché de prefijos. Con `-workers 0` no hay simulados.
+3. Crea la colocación elegida con `-placement`, el `metrics.Metrics`, un `scheduler.Scheduler` (que arranca su dispatcher) y el `httpapi.Server`; al salir, `Close()` para el dispatcher.
+4. Arranca un `vllm.Connector` por cada URL de `-vllm` (Fase 6a) y un `vllm.DNSWatcher` por cada nombre de `-vllm-dns` (Fase 7). Registran los servidores vLLM cuando están listos.
+5. Arranca `http.Server` con `ReadHeaderTimeout: 10s` y **sin `WriteTimeout`** (un `WriteTimeout` cortaría cualquier stream SSE largo). Con `-admin-addr`, un segundo servidor sirve las rutas internas (ver abajo).
+6. Al recibir `SIGINT`/`SIGTERM` llama a `Shutdown` con `-shutdown-grace`: deja de aceptar conexiones y espera a que terminen los streams en curso. Si se agota la gracia, `Close()` corta las conexiones restantes; eso cancela sus contextos y, por tanto, libera sus leases.
 
-Además de las rutas de `httpapi`, `cmd/platform` sirve los endpoints de administración de los workers simulados (`admin.go`): `POST /debug/workers` (alta), `DELETE /debug/workers/{id}` (baja con drenaje), `POST /debug/workers/{id}/faults` (inyectar fallos) y `POST /debug/workers/{id}/restart`. Ver [05](05-api-http.md#administración-de-workers-simulados-fase-4).
+`httpapi` separa sus rutas en públicas (`RegisterPublic`: la API y `/healthz`) e internas (`RegisterDebug`: `/debug/workers`, `/debug/scheduler`). Sin `-admin-addr` todo va en `-addr`; con él, las internas, `/metrics` y la administración de workers simulados solo se sirven en ese puerto, que en Kubernetes no expone el Service público (Fase 7, FI-10). Además, `cmd/platform` sirve los endpoints de administración de los workers simulados (`admin.go`): `POST /debug/workers` (alta), `DELETE /debug/workers/{id}` (baja con drenaje), `POST /debug/workers/{id}/faults` (inyectar fallos) y `POST /debug/workers/{id}/restart`. Ver [05](05-api-http.md#administración-de-workers-simulados-fase-4).
 
 Logs: JSON estructurado (`log/slog`) a stdout. El scheduler escribe con `component=scheduler`.
 
 ### `internal/metrics` — métricas Prometheus (Fase 5)
 
-Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_golang`, la primera dependencia externa del módulo ([11 · Decisión 1](11-fase-5-decisiones.md#decisión-1-librería-de-métricas)). Combina dos mecanismos:
+Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_golang`, la primera dependencia externa del módulo ([12 · Decisión 1](12-fase-5-decisiones.md#decisión-1-librería-de-métricas)). Combina dos mecanismos:
 
 | Mecanismo | Para qué | Cómo |
 | :--- | :--- | :--- |
 | **Eventos** | Contadores e histogramas: cada petición, cada token, cada fallo, cada transición del breaker | `Metrics` implementa `httpapi.Observer` y `scheduler.Observer`, dos interfaces pequeñas definidas por quien las consume. Por defecto son vacías: el núcleo no sabe nada de Prometheus. |
 | **Estado** | Gauges de lo que hay ahora: cola, reservado, salud, árbol de prefijos | Un *collector* lee `Scheduler.Stats()` y `Snapshots()` en cada *scrape*: los mismos datos que `/debug`, así que no pueden contradecirse. |
 
-`cmd/platform` crea un `metrics.Metrics`, lo pasa como `Observer` a la API y al scheduler, llama a `Watch(sched)` y sirve `GET /metrics` en el mismo puerto (FI-10). El catálogo completo está en [12 · Observabilidad](12-observabilidad.md#catálogo-de-métricas).
+`cmd/platform` crea un `metrics.Metrics`, lo pasa como `Observer` a la API y al scheduler, llama a `Watch(sched)` y sirve `GET /metrics` (en `-admin-addr` si está definido; si no, en el puerto de la API). El catálogo completo está en [observabilidad · Observabilidad](../operaciones/03-observabilidad.md#catálogo-de-métricas).
 
 | Flag | Por defecto | Qué controla |
 | :--- | :--- | :--- |
-| `-addr` | `:8080` | Dirección de escucha. |
+| `-addr` | `:8080` | Dirección de escucha de la API. |
+| `-admin-addr` | vacío | Puerto aparte para `/metrics`, `/debug/*` y la administración de workers (Fase 7, FI-10); vacío = todo en `-addr`. |
 | `-workers` | `3` | Número de workers simulados. |
 | `-models` | `sim-llama-3-8b` | Modelos (separados por comas) que sirve cada worker. |
 | `-token-budget` | `16384` | Capacidad de KV-Cache simulada por worker, en tokens. |
@@ -237,18 +239,22 @@ Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_g
 | `-vllm` | vacío | URLs de servidores vLLM separadas por comas (Fase 6a); cada uno se registra cuando está listo. Con `-workers 0`, solo vLLM. |
 | `-vllm-api-key` | `$VLLM_API_KEY` | API key de vLLM (`Authorization: Bearer`). |
 | `-vllm-token-budget` | `0` (descubrir) | Presupuesto de cada worker vLLM si `vllm:cache_config_info` no está disponible. |
+| `-vllm-dns` | vacío | Nombres `host:puerto` separados por comas; cada IP que resuelven es un servidor vLLM (Service *headless* de Kubernetes, Fase 7). |
+| `-vllm-dns-interval` | `10s` | Cada cuánto se resuelven los nombres de `-vllm-dns`. |
 | `-ttft-timeout-per-token` | `1ms` | Timeout de primer token extra por token de prompt (Fase 6b-CPU). Con vLLM en CPU, `25ms` (el prefill va a ~15 ms/token). |
 | `-shutdown-grace` | `15s` | Gracia para los streams en curso al apagar. |
 
-## Cómo se separará en procesos más adelante
+## Del prototipo en memoria al despliegue
 
-| Hoy (en memoria) | Futuro |
+Cómo ha evolucionado cada pieza desde la Fase 1 y qué queda abierto:
+
+| Fase 1 (en memoria) | Estado final |
 | :--- | :--- |
-| `simworker.Worker` en el mismo proceso | **Hecho (6a/6b-CPU):** `vllm.Worker` habla por HTTP con vLLM; probado con el falso y con **vLLM 0.34 real en CPU** (no se probará en GPUs). |
-| Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el DNS de un Service *headless* (Fase 7, `-vllm-dns`; se descartó el *watch* de la API por sus dependencias y permisos). |
-| Healthchecks contra `simworker.Health` | `GET /health` de vLLM desde el `VLLMAdapter` (Fase 6). |
-| `/metrics` y `/debug` en el puerto de la API | Puerto de administración solo accesible dentro del clúster (FI-10, Fase 7, `-admin-addr`). |
-| Stack local con `docker-compose` (`deploy/observability`) | Prometheus y Grafana del clúster; el dashboard JSON se reutiliza. |
-| `PrefixAffinity` aproxima las cachés con su propio árbol LRU (Fase 3) | Corregirlo con eventos de KV-Cache de vLLM, si la versión fijada los publica (Fase 6). |
-| Caché de prefijos simulada en `simworker` | *Automatic prefix caching* de vLLM; `PrefixHashes` deja de usarse en el worker. |
-| Una réplica | Varias réplicas: ver **FI-2**. |
+| `simworker.Worker` en el mismo proceso | **Hecho (6a, 6b-CPU):** `vllm.Worker` habla por HTTP con vLLM; probado con el falso y con **vLLM 0.34 real en CPU** (no se probará en GPUs). El simulador sigue para los tests y las comparaciones. |
+| Lista fija de workers | **Hecho:** registro en caliente con drenaje (Fase 4), alimentado por `main`, `/debug/workers`, los conectores de `-vllm` (6a) y el DNS de un Service *headless* (Fase 7, `-vllm-dns`; se descartó el *watch* de la API de Kubernetes por sus dependencias y permisos). |
+| Sin healthchecks | **Hecho:** healthchecks, breaker y reintentos (Fase 4); con vLLM, `GET /health` y `/metrics` desde el adaptador (6a). |
+| `/metrics` y `/debug` en el puerto de la API | **Hecho (Fase 7):** puerto de administración con `-admin-addr`, solo accesible dentro del clúster. Sin autenticación. |
+| Sin despliegue | **Hecho:** stacks de Docker (`deploy/observability`, Fases 5–6b) y chart de Helm en minikube con autoscaling por KEDA (Fase 7); el mismo dashboard y las mismas alertas en ambos. |
+| `PrefixAffinity` aproxima las cachés con su propio árbol LRU (Fase 3) | **Se mantiene:** con vLLM real, el acierto previsto quedó a menos de un punto del real (6b-CPU), así que no hizo falta leer eventos de KV-Cache del motor. |
+| Caché de prefijos simulada en `simworker` | Con vLLM, *automatic prefix caching* del motor; el adaptador no envía `PrefixHashes`, que solo usa el router. |
+| Una réplica | **Abierto (FI-2):** una réplica con estrategia `Recreate` en Kubernetes (Fase 7). |

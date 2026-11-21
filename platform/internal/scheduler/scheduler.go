@@ -1,7 +1,7 @@
 // Package scheduler admits requests and places them on workers.
 //
 // It is split in two halves behind a single Acquire method
-// (docs/servicio/08-fase-2-decisiones.md, decision 3):
+// (docs/servicio/09-fase-2-decisiones.md, decision 3):
 //
 //   - Admission decides WHEN a request may try for capacity: one bounded FIFO
 //     queue per model, a queue timeout, early rejection (load shedding) and a
@@ -15,7 +15,7 @@
 // HeadMaxAge; from then on a FIFO barrier stops anyone else of that model
 // from passing it until it is admitted.
 //
-// Phase 4 (docs/servicio/10-fase-4-decisiones.md) adds the worker lifecycle
+// Phase 4 (docs/servicio/11-fase-4-decisiones.md) adds the worker lifecycle
 // around both halves: workers are added and removed at run time (removal
 // drains), health checks and a circuit breaker per worker decide which
 // workers placement may use, slow workers are only used when the others are

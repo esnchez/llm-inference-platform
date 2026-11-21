@@ -10,7 +10,7 @@ import (
 )
 
 // Observer receives one record per request, for metrics (Phase 5,
-// docs/servicio/11-fase-5-decisiones.md, decision 2). internal/metrics
+// docs/servicio/12-fase-5-decisiones.md, decision 2). internal/metrics
 // implements it with Prometheus. Implementations must be fast and safe for
 // concurrent use.
 type Observer interface {

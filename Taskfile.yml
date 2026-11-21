@@ -51,7 +51,7 @@ tasks:
       - go build -o bin/loadgen{{exeExt}} ./cmd/loadgen
       - go build -o bin/fakevllm{{exeExt}} ./cmd/fakevllm
 
-  # ---- observability stack (Phase 5, docs/servicio/12-observabilidad.md) ----
+  # ---- observability stack (Phase 5, docs/operaciones/03-observabilidad.md) ----
 
   stack:up:
     desc: "Start platform + Prometheus + Grafana in Docker (http://localhost:3000, :9090, :8080)"
@@ -88,7 +88,7 @@ tasks:
     cmds:
       - docker compose --profile two -f {{.STACK_FILE}} -f {{.STACK_VLLM_CPU}} down --remove-orphans
 
-  # ---- local Kubernetes (Phase 7, docs/servicio/16) ----
+  # ---- local Kubernetes (Phase 7, docs/servicio/15) ----
 
   k8s:up:
     desc: "Start minikube (profile llm-platform), load the images, install KEDA and the chart (extra helm flags: task k8s:up -- --set vllmCpu.enabled=true)"

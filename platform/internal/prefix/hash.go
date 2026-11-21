@@ -1,6 +1,6 @@
 // Package prefix finds the prompt prefixes that requests share, so the
 // control plane can send a request to the worker that already holds that
-// prefix in its KV cache (Phase 3, docs/servicio/09-fase-3-decisiones.md).
+// prefix in its KV cache (Phase 3, docs/servicio/10-fase-3-decisiones.md).
 //
 // It has two parts:
 //
