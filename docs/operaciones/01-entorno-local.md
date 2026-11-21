@@ -91,7 +91,7 @@ minikube con un **perfil propio** (`llm-platform`), así que no toca otros clús
 ```bash
 task k8s:up              # perfil de minikube (6 CPU, 10 GB), imágenes, KEDA y el chart deploy/helm/llm-platform
 task k8s:port-forward    # API :8080, Grafana :3000, puerto de administración (/metrics, /debug) en :18081
-cd platform && go run ./cmd/loadgen -admin-url http://localhost:18081 -rate 1.5 -duration 180s -prefixes 8
+task loadgen -- -admin-url http://localhost:18081 -rate 1.5 -duration 180s -prefixes 8
 task k8s:status          # pods, ScaledObject y HPA
 task k8s:down            # borra el perfil (clúster y datos)
 ```

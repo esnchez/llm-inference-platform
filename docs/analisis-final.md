@@ -40,7 +40,7 @@ flowchart LR
 | Tests | 119 funciones de test, `-race -count=5` en Go 1.23, estrés con caos, batería de contrato común a todos los workers, tests contra respuestas reales de vLLM |
 | Fases | 1 Streaming y leases · 2 Colas y *load shedding* · 3 Routing por prefijos · 4 Resiliencia · 5 Observabilidad · 6a Adaptador vLLM · 6b-CPU vLLM real en CPU · 7 Kubernetes en local (Helm, autoscaling con KEDA) |
 | Despliegue | Docker Compose (tres variantes) y un chart de Helm validado en minikube; CI en GitHub Actions (formato, vet, tests con `-race`, `helm lint`) |
-| Documentación | Un documento de decisiones por fase (alternativas, opción elegida, por qué) y una limitación registrada (FI-n) por cada atajo consciente |
+| Documentación | Un documento de decisiones por fase, de la 1 (reconstruida a posteriori) a la 7, con alternativas, opción elegida y por qué; una limitación registrada (FI-n) por cada atajo consciente; los resultados de todas las pruebas en un solo documento |
 
 ## Los razonamientos que lo han traído hasta aquí
 
@@ -192,6 +192,8 @@ Resueltas por el camino: FI-4 (métricas de vLLM), FI-5 (roadmap), FI-6 (diseño
 
 ## Cómo reproducir las pruebas
 
+Requisitos, variantes y problemas conocidos de cada entorno: [entorno local](operaciones/01-entorno-local.md). Montaje y cifras de cada prueba: [resultados](operaciones/04-resultados-de-pruebas.md).
+
 ```bash
 task check            # formato, vet y tests
 task test:race        # -race -count=5 en Go 1.23 (Docker)
@@ -209,6 +211,6 @@ task stack:down
 
 task k8s:up                                                   # Fase 7: minikube + KEDA + chart (ver operaciones/01)
 task k8s:port-forward                                         # API :8080, Grafana :3000, admin :18081
-cd platform && go run ./cmd/loadgen -admin-url http://localhost:18081 -rate 1.5 -duration 180s -prefixes 8
+task loadgen -- -admin-url http://localhost:18081 -rate 1.5 -duration 180s -prefixes 8
 task k8s:status && task k8s:down
 ```
