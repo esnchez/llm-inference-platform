@@ -44,6 +44,10 @@ var _ inference.Lease = (*managedLease)(nil)
 // lease (Phase 5: the per-request log).
 func (l *managedLease) QueueWait() time.Duration { return l.queueWait }
 
+// ReservedTokens is what the request reserves in the ledger, after any
+// clamping of max_tokens to the context length (Phase 6b-CPU).
+func (l *managedLease) ReservedTokens() int { return l.req.TokenCost() }
+
 // Retries is how many times the request moved to another worker.
 func (l *managedLease) Retries() int {
 	l.mu.Lock()

@@ -237,13 +237,14 @@ Es el único paquete, junto con `cmd/platform`, que importa `prometheus/client_g
 | `-vllm` | vacío | URLs de servidores vLLM separadas por comas (Fase 6a); cada uno se registra cuando está listo. Con `-workers 0`, solo vLLM. |
 | `-vllm-api-key` | `$VLLM_API_KEY` | API key de vLLM (`Authorization: Bearer`). |
 | `-vllm-token-budget` | `0` (descubrir) | Presupuesto de cada worker vLLM si `vllm:cache_config_info` no está disponible. |
+| `-ttft-timeout-per-token` | `1ms` | Timeout de primer token extra por token de prompt (Fase 6b-CPU). Con vLLM en CPU, `25ms` (el prefill va a ~15 ms/token). |
 | `-shutdown-grace` | `15s` | Gracia para los streams en curso al apagar. |
 
 ## Cómo se separará en procesos más adelante
 
 | Hoy (en memoria) | Futuro |
 | :--- | :--- |
-| `simworker.Worker` en el mismo proceso | **Hecho (6a):** `vllm.Worker` habla por HTTP con un vLLM (hoy, el falso); en la 6b, con pods de vLLM con GPU. |
+| `simworker.Worker` en el mismo proceso | **Hecho (6a/6b-CPU):** `vllm.Worker` habla por HTTP con vLLM; probado con el falso y con **vLLM 0.34 real en CPU** (no se probará en GPUs). |
 | Registro en el scheduler, alimentado por `main` y por `/debug/workers` (Fase 4) | Alimentado por el *watch* de los Endpoints de Kubernetes (Fase 7). |
 | Healthchecks contra `simworker.Health` | `GET /health` de vLLM desde el `VLLMAdapter` (Fase 6). |
 | `/metrics` y `/debug` en el puerto de la API | Puerto de administración solo accesible dentro del clúster (FI-10, Fase 7). |

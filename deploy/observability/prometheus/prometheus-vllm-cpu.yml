@@ -1,0 +1,15 @@
+# Prometheus for the vLLM-on-CPU variant of the stack (Phase 6b-CPU).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: platform
+    static_configs:
+      - targets: ["platform:8080"]
+  - job_name: vllm
+    static_configs:
+      - targets: ["vllm-1:8000", "vllm-2:8000"] # vllm-2 is DOWN unless started (task stack:up:vllm-cpu:2)

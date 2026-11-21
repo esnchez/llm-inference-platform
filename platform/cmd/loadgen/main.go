@@ -57,6 +57,7 @@ func main() {
 		prefixes  = flag.Int("prefixes", 0, "number of distinct system prompts shared by chat requests; 0 = no system prompt")
 		sysChars  = flag.Int("system-chars", 6000, "size of each system prompt, in characters (~4 per token)")
 		skew      = flag.Float64("prefix-skew", 0, "Zipf exponent (> 1) for choosing the system prompt, so a few are hot; 0 = uniform")
+		namespace = flag.String("prefix-namespace", "", "text mixed into every system prompt, so that a new run starts with prompts no engine has cached")
 		chaos     = flag.String("chaos", "", "break one worker during the run: down, hang, errors (50% of streams fail), stall, slow or restart; empty = none")
 		chaosWkr  = flag.String("chaos-worker", "sim-worker-1", "worker that -chaos breaks: a simulated worker ID, or the URL of a fake vLLM (e.g. http://localhost:8001)")
 		chaosAt   = flag.Duration("chaos-at", 0, "when the fault starts; 0 = a third into -duration")
@@ -75,7 +76,7 @@ func main() {
 	systems := make([]string, *prefixes)
 	for i := range systems {
 		// Distinct from the first character, so they share no block.
-		head := fmt.Sprintf("Sistema %d. Eres el asistente número %d. ", i, i)
+		head := fmt.Sprintf("Sistema %d%s. Eres el asistente número %d. ", i, *namespace, i)
 		systems[i] = (head + strings.Repeat("Sigue estas instrucciones con cuidado. ", *sysChars/39+1))[:*sysChars]
 	}
 	pickSystem := func() int { return rng.IntN(len(systems)) }

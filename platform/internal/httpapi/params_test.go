@@ -132,14 +132,29 @@ func TestEngineUsageIsReported(t *testing.T) {
 	}
 }
 
-// TestMaxModelLenRejectsAtOnce: a request that fits the budget but not the
-// engine's max_model_len gets a 400 at once, without queueing (C3).
-func TestMaxModelLenRejectsAtOnce(t *testing.T) {
-	ts := engineServer(t, nil, 50, &records{})
-	resp := post(t, context.Background(), ts.URL, chatBody(100, true, ""))
+// TestContextLength: like vLLM, a max_tokens that does not fit in the
+// engine's context (max_model_len) is clamped, not rejected (Phase 6b-CPU,
+// decision 2); a prompt that does not fit by itself gets a 400 at once,
+// without queueing.
+func TestContextLength(t *testing.T) {
+	obs := &records{}
+	ts := engineServer(t, nil, 50, obs)
+
+	resp := post(t, context.Background(), ts.URL, chatBody(100, false, "")) // prompt ~7 tokens + 100 > 50
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("max_tokens over the context must be clamped: %d %s", resp.StatusCode, body)
+	}
+	if rec := obs.wait(t, 1)[0]; rec.ReservedTokens != 50 {
+		t.Fatalf("reserved %d tokens, want the 50 of the context (clamped)", rec.ReservedTokens)
+	}
+
+	long := `{"model":"` + model + `","max_tokens":5,"messages":[{"role":"user","content":"` + strings.Repeat("palabra ", 40) + `"}]}`
+	resp = post(t, context.Background(), ts.URL, long)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "context_length_exceeded") {
-		t.Fatalf("%d %s", resp.StatusCode, body)
+		t.Fatalf("a prompt over the context: %d %s", resp.StatusCode, body)
 	}
 }

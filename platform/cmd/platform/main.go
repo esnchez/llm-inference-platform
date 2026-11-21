@@ -54,7 +54,8 @@ func run() error {
 		healthEvery   = flag.Duration("health-interval", 2*time.Second, "how often each worker is health-checked; negative = no health checks")
 		breakerFails  = flag.Int("breaker-failures", 5, "consecutive worker failures that open its circuit breaker")
 		breakerWait   = flag.Duration("breaker-cooldown", 10*time.Second, "how long a breaker stays open before a probe (doubles on each reopening, max 2m)")
-		ttftTimeout   = flag.Duration("ttft-timeout", 10*time.Second, "a stream with no first token after this (+1ms per prompt token) is a hung worker")
+		ttftTimeout   = flag.Duration("ttft-timeout", 10*time.Second, "a stream with no first token after this (+ -ttft-timeout-per-token per prompt token) is a hung worker")
+		ttftPerToken  = flag.Duration("ttft-timeout-per-token", time.Millisecond, "extra TTFT timeout per prompt token; on CPU vLLM use ~25ms (prefill is ~15ms/token)")
 		stallTimeout  = flag.Duration("stall-timeout", 10*time.Second, "a stream with no new token for this long is a hung worker")
 		maxRetries    = flag.Int("max-retries", 1, "retries on another worker when one fails before the first token; -1 = none")
 		shutdownGrace = flag.Duration("shutdown-grace", 15*time.Second, "time given to in-flight streams on shutdown")
@@ -117,12 +118,13 @@ func run() error {
 		MaxQueuedRequests: *maxQueued,
 		Placement:         place,
 
-		HealthInterval:  *healthEvery,
-		BreakerFailures: *breakerFails,
-		BreakerCooldown: *breakerWait,
-		TTFTTimeout:     *ttftTimeout,
-		StallTimeout:    *stallTimeout,
-		MaxRetries:      *maxRetries,
+		HealthInterval:      *healthEvery,
+		BreakerFailures:     *breakerFails,
+		BreakerCooldown:     *breakerWait,
+		TTFTTimeout:         *ttftTimeout,
+		TTFTTimeoutPerToken: *ttftPerToken,
+		StallTimeout:        *stallTimeout,
+		MaxRetries:          *maxRetries,
 
 		Observer: mtr,
 		Logger:   log.With("component", "scheduler"),

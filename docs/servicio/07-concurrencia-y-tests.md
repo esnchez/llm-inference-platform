@@ -221,11 +221,17 @@ Montan las piezas reales como `cmd/platform` (workers simulados, scheduler y API
 | `TestEndToEnd` | API + scheduler + adaptador + dos vLLM falsos, uno roto: todas las respuestas `200`, `usage` del motor (no la estimación), reintentos con éxito. |
 | `TestStressWithChaos` | 400 peticiones concurrentes contra 3 vLLM falsos que fallan, se cuelgan, cortan, emiten errores, se reinician y dejan de estar sanos: ningún ledger sobre su presupuesto, un resultado por petición, nada reservado ni en curso al final. |
 
-En `internal/httpapi` (Fase 6a): `TestParamsAreForwarded`, `TestUnsupportedParamsAreRejected`, `TestMessageContentMustBeAString`, `TestEngineUsageIsReported` (el `usage` del motor en la respuesta con y sin streaming, y en el registro de métricas) y `TestMaxModelLenRejectsAtOnce` (`400` inmediato, sin cola).
+En `internal/httpapi` (Fase 6a): `TestParamsAreForwarded`, `TestUnsupportedParamsAreRejected`, `TestMessageContentMustBeAString`, `TestEngineUsageIsReported` (el `usage` del motor en la respuesta con y sin streaming, y en el registro de métricas) y `TestContextLength` (Fase 6b-CPU: un `max_tokens` que no cabe en `max_model_len` se recorta y se reserva lo recortado; un prompt que no cabe da `400` inmediato, sin cola).
+
+**Contra vLLM real (Fase 6b-CPU):**
+
+- `TestCapturedStream`, `TestCapturedErrors`, `TestCapturedDiscovery`: el parser SSE, la tabla de errores, el descubrimiento y la lectura de `/metrics` contra **respuestas reales de vLLM 0.34** guardadas en `internal/vllm/testdata/vllm-0.34.0/` (bloques de 128, 682 bloques, 87 296 tokens).
+- `TestRealVLLM`: la prueba de humo contra un vLLM en marcha; solo se ejecuta si `VLLM_URL` está definida (`task vllm-cpu:up` y `task vllm-cpu:smoke`). Comprueba descubrimiento, `usage` real, `400` de prompt demasiado largo, el recorte de `max_tokens`, que cancelar detiene la generación (vía `num_requests_running`) y los nombres de las métricas (FI-4). Pasa contra `v0.34.0-x86_64` en CPU.
 
 ### Huecos conocidos
 
-- **El vLLM falso imita lo que creemos que hace vLLM.** Formatos y nombres de métricas están sin contrastar con una versión concreta: es lo primero de la 6b ([13](13-fase-6a-decisiones.md#lo-que-el-falso-no-puede-decir-pendiente-de-la-6b)).
+- **El vLLM falso no se ha reajustado** a las capturas reales (por ejemplo, usa bloques de 16 por defecto y no recorta `max_tokens`). Los formatos coinciden y los tests del parser corren contra las capturas, que es lo que importa; el falso sirve para probar fallos, no para imitar magnitudes.
+- `TestRealVLLM` no entra en `task check`: tarda minutos en arrancar vLLM y necesita una imagen de 1,8 GB.
 
 - El stack de observabilidad (Dockerfile, compose, dashboard) no tiene tests automáticos. Se validó al cerrar la Fase 5: `promtool check config`/`check rules`, cada consulta del dashboard contra Prometheus tras una prueba con `loadgen`, y revisión visual de una captura.
 

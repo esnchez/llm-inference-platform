@@ -1,0 +1,45 @@
+# Variant of the stack (Phase 6b-CPU): the platform in front of real vLLM
+# running on CPU (no GPUs: docs/servicio/14-fase-6b-cpu-decisiones.md).
+# Layered on docker-compose.yml:
+#   task stack:up:vllm-cpu     one vLLM instance
+#   task stack:up:vllm-cpu:2   two instances (the benchmark)
+#
+# Slow by nature: ~6 min of warm-up per instance (more the first time, while
+# the model downloads into the vllm-hf-cache volume) and ~4 tokens/s. The
+# platform registers each instance when it is ready (log "vllm registered").
+# KV cache per instance: VLLM_KV_BYTES (default 1 GiB ≈ 43k tokens).
+services:
+  platform:
+    # CPU profile (decision 5): a cold 2000-token prefill takes ~30 s here.
+    command: ["-addr", ":8080", "-workers", "0", "-vllm", "${VLLM_URLS:-http://vllm-1:8000}",
+              "-ttft-timeout", "30s", "-ttft-timeout-per-token", "25ms", "-stall-timeout", "30s",
+              "-placement", "${PLACEMENT:-prefix}"]
+
+  vllm-1: &vllm
+    image: vllm/vllm-openai-cpu:v0.34.0-x86_64
+    command: ["Qwen/Qwen2.5-0.5B-Instruct", "--dtype", "float32", "--max-model-len", "4096",
+              "--kv-cache-memory-bytes", "${VLLM_KV_BYTES:-1073741824}"]
+    environment:
+      # Each instance on its own cores, so that two do not fight (conflict C3).
+      VLLM_CPU_OMP_THREADS_BIND: "0-2"
+    shm_size: 2g
+    volumes:
+      - vllm-hf-cache:/root/.cache/huggingface
+    ports: ["8101:8000"]
+    restart: unless-stopped
+
+  vllm-2:
+    <<: *vllm
+    environment:
+      VLLM_CPU_OMP_THREADS_BIND: "4-6"
+    ports: ["8102:8000"]
+    profiles: ["two"]
+
+  prometheus:
+    volumes:
+      - ./prometheus/prometheus-vllm-cpu.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+volumes:
+  vllm-hf-cache:
+    name: vllm-hf-cache # the model cache shared with `task vllm-cpu:up`

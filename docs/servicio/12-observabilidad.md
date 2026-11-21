@@ -42,6 +42,7 @@ task stack:up                     # construye la imagen y arranca plataforma + P
 task loadgen -- -rate 4 -duration 2m -prefixes 24 -rag-fraction 0      # tráfico con prefijos compartidos
 task loadgen -- -rate 5 -duration 100s -prefixes 24 -chaos hang        # o con un worker que se cuelga a mitad
 task stack:up:fake-vllm           # variante (Fase 6a): la plataforma habla por HTTP con 3 vLLM falsos (:8001-8003)
+task stack:up:vllm-cpu            # variante (Fase 6b-CPU): vLLM real en CPU (~6 min de calentamiento); :2 para dos instancias
 task loadgen -- -rate 5 -duration 90s -prefixes 24 -chaos hang -chaos-worker http://localhost:8001   # caos sobre un vLLM falso
 task stack:logs                   # logs JSON de la plataforma
 task stack:down                   # para y borra el stack (no guarda datos)

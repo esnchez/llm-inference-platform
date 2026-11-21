@@ -1,0 +1,1 @@
+{"error":{"message":"temperature must be non-negative, got -3.0. (parameter=temperature, value=-3.0)","type":"BadRequestError","param":"temperature","code":400}}

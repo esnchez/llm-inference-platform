@@ -93,6 +93,7 @@ func failureOutcome(ctx context.Context, err error) string {
 // leaseDetails is implemented by the scheduler's lease (Phase 5): what the
 // per-request log reports about the queue, retries and the worker's TTFT.
 type leaseDetails interface {
+	ReservedTokens() int
 	QueueWait() time.Duration
 	Retries() int
 	WorkerTTFT() time.Duration

@@ -1,6 +1,6 @@
 # Documentación del servicio
 
-Esta carpeta explica **cómo funciona la implementación actual** (Fases 1 a 5 y 6a) de la plataforma: qué hace cada componente, cómo viaja una petición de principio a fin, por qué está diseñado así y qué relación tiene cada pieza con los workers reales de vLLM que la sustituirán.
+Esta carpeta explica **cómo funciona la implementación actual** (Fases 1 a 5, 6a y 6b-CPU) de la plataforma: qué hace cada componente, cómo viaja una petición de principio a fin, por qué está diseñado así y qué relación tiene cada pieza con los workers reales de vLLM que la sustituirán.
 
 El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitectura y el roadmap. Estos documentos bajan al nivel del código.
 
@@ -23,6 +23,8 @@ El [README raíz](../../README.md) cuenta la visión, las decisiones de arquitec
 | 11 | [Fase 5: decisiones de diseño](11-fase-5-decisiones.md) | Librería de métricas, arquitectura de la instrumentación, logs, stack local con Prometheus y Grafana, alcance, y lo que se encontró al validar. |
 | 12 | [Observabilidad](12-observabilidad.md) | **Guía de uso.** Cómo arrancar el stack, qué se mide y por qué, catálogo de métricas, el dashboard panel a panel y cómo leerlo, un ejemplo de lectura con una captura real, guía de diagnóstico, logs, SLO y alertas, relación con las métricas de vLLM. |
 | 13 | [Fase 6a: decisiones de diseño](13-fase-6a-decisiones.md) | Adaptador vLLM sin GPU, implementado: petición completa en el contrato, tokens reales, ledger compartido, descubrimiento de workers, traducción de errores, métricas del motor, vLLM falso, empaquetado; y lo que el falso no puede decir. |
+| 14 | [Fase 6b-CPU: decisiones de diseño](14-fase-6b-cpu-decisiones.md) | vLLM real en CPU (sin GPUs), implementada con criterio de sencillez — qué sí y qué no: verificación de viabilidad, seis hallazgos y sus correcciones, prueba de humo repetible, stack con vLLM en CPU, mediciones relativas (FI-1, FI-3, FI-6) y benchmark router frente a round-robin, con resultados y limitaciones aceptadas. |
+| 15 | [Análisis final](15-analisis-final.md) | **Para defender el proyecto:** los razonamientos clave con su evidencia, qué se midió y en qué entorno, lo que demostró vLLM real en CPU, puntos fuertes, limitaciones, distancia a producción con GPUs y preguntas difíciles con su respuesta. |
 
 ## Glosario rápido
 

@@ -245,6 +245,9 @@ func (s *Server) handleChatCompletions(rw http.ResponseWriter, r *http.Request) 
 	defer lease.Release()
 	rec.Admitted = true
 	rec.PromptTokens, rec.ReservedTokens = req.PromptTokens, req.TokenCost()
+	if d, ok := lease.(leaseDetails); ok {
+		rec.ReservedTokens = d.ReservedTokens() // max_tokens may have been clamped (Phase 6b-CPU)
+	}
 	s.cfg.Observer.RequestStarted(rec.Model)
 
 	// ctx is cancelled when the client disconnects or when we fail to write
@@ -292,7 +295,7 @@ func (s *Server) finish(log *slog.Logger, w *statusWriter, start time.Time, rec 
 	s.cfg.Observer.RequestFinished(rec)
 
 	attrs := []any{"model", rec.Model, "outcome", outcome, "http_status", w.status,
-		"completion_tokens", res.completionTokens, "duration_ms", rec.Duration.Milliseconds()}
+		"completion_tokens", rec.CompletionTokens, "duration_ms", rec.Duration.Milliseconds()}
 	if rec.FirstToken {
 		attrs = append(attrs, "ttft_ms", rec.TTFT.Milliseconds())
 	}

@@ -156,7 +156,7 @@ func (s *Scheduler) forgetLocked(id string) {
 // recomputeLocked derives each model's limits from its active workers.
 func (s *Scheduler) recomputeLocked() {
 	for _, m := range s.models {
-		m.serving, m.maxBudget, m.tokenLimit = 0, 0, 0
+		m.serving, m.maxBudget, m.tokenLimit, m.maxContext = 0, 0, 0, 0
 	}
 	for _, mem := range s.order {
 		if mem.draining {
@@ -168,6 +168,7 @@ func (s *Scheduler) recomputeLocked() {
 			largest := mem.budget
 			if mem.maxReq > 0 {
 				largest = min(largest, mem.maxReq) // conflict C3 of Phase 6a
+				m.maxContext = max(m.maxContext, mem.maxReq)
 			}
 			m.maxBudget = max(m.maxBudget, largest)
 			m.tokenLimit += mem.budget

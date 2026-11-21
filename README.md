@@ -1,6 +1,6 @@
 # Distributed LLM Inference Platform
 
-> **Estado:** Fases 1 a 5 y 6a implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados; adaptador vLLM probado contra un vLLM falso). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md), [Fase 5](docs/servicio/11-fase-5-decisiones.md), [Fase 6a](docs/servicio/13-fase-6a-decisiones.md). **Observabilidad:** [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md).  
+> **Estado:** Fases 1 a 5, 6a y 6b-CPU implementadas (Data Plane streaming con workers simulados; scheduler con colas acotadas y *load shedding*; routing por afinidad de prefijo con Radix Tree; resiliencia con healthchecks, *circuit breakers*, reintentos y alta/baja de workers en caliente; observabilidad con Prometheus, Grafana y logs estructurados; adaptador vLLM verificado contra vLLM 0.34 real en CPU; el proyecto no se prueba en GPUs). Decisiones: [Fase 2](docs/servicio/08-fase-2-decisiones.md), [Fase 3](docs/servicio/09-fase-3-routing-por-prefijos.md), [Fase 4](docs/servicio/10-fase-4-decisiones.md), [Fase 5](docs/servicio/11-fase-5-decisiones.md), [Fase 6a](docs/servicio/13-fase-6a-decisiones.md), [Fase 6b-CPU](docs/servicio/14-fase-6b-cpu-decisiones.md). **Observabilidad:** [`docs/servicio/12-observabilidad.md`](docs/servicio/12-observabilidad.md). **Análisis final** (razonamientos, evidencias, limitaciones y distancia a producción): [`docs/servicio/15-analisis-final.md`](docs/servicio/15-analisis-final.md).  
 > **Documentación de la implementación:** [`docs/servicio/`](docs/servicio/README.md) (componentes, recorrido de una petición, leases, relación con vLLM).  
 > **Objetivo:** Construir una plataforma de serving de LLM distribuida a nivel de producción, con routing consciente de KV-Cache (Prefix-aware), scheduling basado en capacidad de tokens (VRAM), control de concurrencia atómico mediante *leases*, y autoscaling predictivo para K8s/vLLM.
 
@@ -205,16 +205,22 @@ Cuando la arquitectura se despliegue en producción con **vLLM**:
 - [x] vLLM falso (`fakevllm`) para tests y para el stack (`task stack:up:fake-vllm`).
 - [x] Empaquetado en Docker de los componentes de Go (`platform/Dockerfile`, una imagen por comando).
 
-**6b — GPUs y benchmark**
+**6b — GPUs y benchmark** *(sustituida: el proyecto no se probará en GPUs reales; ver 6b-CPU)*
 - [ ] Provisionar clúster efímero de GPUs (AWS/RunPod) con modelos ligeros (Llama-3-8B).
 - [ ] Fijar la versión de vLLM (FI-4), calibrar timeouts y revisar FI-1 y FI-3 con datos reales.
 - [ ] Benchmarking (llmperf) comparando el Router Inteligente vs Balanceo clásico.
+
+**6b-CPU — vLLM real en CPU** *(viabilidad comprobada el 2026-11-21; decisiones —qué sí y qué no—, resultados y limitaciones: [`docs/servicio/14-fase-6b-cpu-decisiones.md`](docs/servicio/14-fase-6b-cpu-decisiones.md))*
+- [x] Fijar vLLM `v0.34.0` (CPU) con capturas reales de sus respuestas en los tests (cierra FI-4).
+- [x] Corregir lo que destapó vLLM real: recorte de `max_tokens`, timeouts de CPU, log. *(El bloque de 128 y la estimación con *chat template* se documentan como limitaciones, no se corrigen.)*
+- [x] Prueba de humo repetible (`task vllm-cpu:smoke`) y stack con vLLM en CPU (`task stack:up:vllm-cpu`).
+- [x] Mediciones relativas (FI-1, FI-3, FI-6) y benchmark router frente a round-robin: con vLLM real, la afinidad sube el acierto de caché del 53 % al 75 % y baja el TTFT mediano ~5× (relativo, en CPU).
 
 ### Fase 7 — Kubernetes Operator (Autoscaling)
 > Revisar antes de empezar: [FI-2](#fi-2-plano-de-control-con-más-de-una-réplica).
 
 - [ ] Despliegue mediante Helm.
-- [ ] Configuración del almacenamiento compartido para pesos (Cold start reduction).
+- [ ] ~~Configuración del almacenamiento compartido para pesos (Cold start reduction).~~ Sin GPUs pierde sentido: basta el volumen de caché del modelo (`vllm-hf-cache`) de la Fase 6b-CPU.
 - [ ] Desarrollo de controlador custom para autoescalar pods basado en métricas nativas (`gpu_cache_usage_factor`, ver [FI-4](#fi-4-nombre-de-la-métrica-de-kv-cache-de-vllm)).
 
 ---
@@ -237,6 +243,8 @@ task loadgen -- -rate 4 -duration 45s -chaos down   # tumba sim-worker-1 a mitad
 # Observabilidad (necesita Docker): plataforma + Prometheus (:9090) + Grafana (:3000) con el dashboard
 task stack:up
 task stack:up:fake-vllm             # variante: la plataforma habla por HTTP con 3 vLLM falsos (Fase 6a)
+task stack:up:vllm-cpu              # variante: vLLM real en CPU (Fase 6b-CPU; ~6 min de calentamiento; :2 para dos instancias)
+task vllm-cpu:up && task vllm-cpu:smoke   # prueba de humo del adaptador contra vLLM real en CPU
 task stack:down
 
 # Contra servidores vLLM (Fase 6a/6b): se registran solos cuando han cargado el modelo
@@ -315,6 +323,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
   - Liberar progresivamente la parte no usada de la reserva y descontar los tokens de prefijo ya cacheados.
   - Usar el lease solo como *slot* de admisión y tomar la ocupación real de las métricas del motor.
 - **Revisar:** al medir la utilización real con vLLM (Fase 6).
+- **Medido (2026-11-21, Fase 6b-CPU):** con vLLM real en CPU, el ledger reservó de media ~3× la KV-Cache que vLLM ocupaba (29,5 % frente a 9,6 %), sobre todo porque cobra el prompt completo aunque esté en caché. El cambio de la reserva queda para una fase propia. Ver [`14`](docs/servicio/14-fase-6b-cpu-decisiones.md#fi-1-reserva-del-ledger-frente-a-kv-cache-real).
 
 ### FI-2. Plano de control con más de una réplica
 - **Decisión actual:** una sola réplica del plano de control; el *ledger* de leases vive en la memoria del proceso.
@@ -331,12 +340,14 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Problema:** el error puede ser de ~2× en código o en idiomas distintos del inglés (incluido el español), lo que distorsiona directamente la admisión (FI-1) y los límites de contexto.
 - **Opciones:** tokenizer por modelo en Go (cgo con HF *tokenizers* o una implementación BPE nativa); el endpoint `/tokenize` de vLLM (un *round-trip* extra antes de admitir); mantener la estimación con un margen de seguridad configurable por modelo; corregir a posteriori con el `usage` real que devuelve el motor.
 - **Revisar:** en la Fase 6, cuando el tokenizer real esté disponible.
+- **Medido (2026-11-21, Fase 6b-CPU):** con prompts de ~1 500 tokens, la estimación se queda un 5 % corta (mediana 0,95). En prompts cortos, la *chat template* añade ~28 tokens fijos que no se cuentan. Se acepta como limitación: el recorte de `max_tokens` y el `400` de vLLM cubren los casos límite.
 - **Avance (2026-11-20, Fase 6a):** con un motor real, la métrica `llmplatform_prompt_token_estimate_ratio` mide el error de la estimación contra su tokenizer, y la respuesta al cliente ya lleva los tokens reales. La decisión (tokenizer o margen) se toma en la 6b con datos de vLLM.
 
 ### FI-4. Nombre de la métrica de KV-Cache de vLLM
 - **Problema:** `vllm:gpu_cache_usage_factor`, citada en las secciones 2, 4.2 y la Fase 7, no existe. vLLM expone `vllm:gpu_cache_usage_perc` (motor V0) y `vllm:kv_cache_usage_perc` (motor V1), ambas como fracción 0–1.
 - **Acción:** fijar la versión de vLLM, comprobar el nombre exacto en su `/metrics` y corregir las referencias. Conviene que el adaptador abstraiga el nombre para soportar cambios entre versiones.
 - **Revisar:** en la Fase 6, al fijar la versión de vLLM.
+- **Resuelto (2026-11-21, Fase 6b-CPU):** fijada `vllm/vllm-openai-cpu:v0.34.0-x86_64`. Expone `vllm:kv_cache_usage_perc` (el adaptador acepta también el nombre antiguo `gpu_cache_usage_perc`), `vllm:cache_config_info` con `num_gpu_blocks` y `block_size`, `prefix_cache_*_total` y `process_start_time_seconds`. Las respuestas reales están en `platform/internal/vllm/testdata/vllm-0.34.0/` y `TestRealVLLM` comprueba los nombres contra un vLLM en marcha.
 
 ### FI-5. Solapamiento del roadmap
 - **Problema:** la reserva atómica de capacidad por worker (listada en la Fase 2) y la propagación de desconexiones del cliente al worker (listada en la Fase 4) ya están implementadas en la Fase 1, porque el contrato de `Lease` las exige.
@@ -349,6 +360,7 @@ Decisiones tomadas conscientemente para avanzar, con el problema que dejan abier
 - **Decisión (2026-11-17, Fase 3):** LRU por worker con la capacidad estimada de su caché (expulsión por hojas), afinidad solo por debajo de una carga de 0,8 y desbordamiento al menos cargado, que replica los prefijos calientes sin configurarlos. En el simulador, el acierto previsto por el árbol quedó a menos de 1 punto del real, y un único *system prompt* para todo el tráfico se replicó en los 3 workers tras 2 desbordamientos. Ver [`09`](docs/servicio/09-fase-3-routing-por-prefijos.md).
 - **Sigue abierto:** el árbol imita la caché porque una sola réplica ve todo el tráfico (FI-2); desde la Fase 4 detecta los reinicios de workers (cambio de `InstanceID`), pero no ve las diferencias de la *chat template* real; los eventos de KV-Cache de vLLM se valorarán en la Fase 6.
 - **Revisar:** en la Fase 6, con la caché real de vLLM.
+- **Medido (2026-11-21, Fase 6b-CPU):** con vLLM real (expulsiones reales, bloques de 128), el acierto previsto por el árbol (75,7 %) quedó a menos de un punto del real (75,0 %).
 
 ### FI-7. El contrato solo transporta el prompt aplanado
 - **Decisión actual:** `httpapi.renderPrompt` convierte los `messages` en texto `role: content\n` y `InferenceRequest` solo lleva ese `Prompt`, que se usa únicamente para estimar el coste. Los parámetros de muestreo (`temperature`, `top_p`, `stop`, …) se aceptan pero se ignoran.

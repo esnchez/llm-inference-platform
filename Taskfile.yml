@@ -12,6 +12,10 @@ vars:
   # Local observability stack (Phase 5).
   STACK_FILE: deploy/observability/docker-compose.yml
   STACK_FAKE_VLLM: deploy/observability/docker-compose.fake-vllm.yml
+  STACK_VLLM_CPU: deploy/observability/docker-compose.vllm-cpu.yml
+  # Real vLLM on CPU (Phase 6b-CPU): pinned image and model.
+  VLLM_CPU_IMAGE: vllm/vllm-openai-cpu:v0.34.0-x86_64
+  VLLM_CPU_MODEL: Qwen/Qwen2.5-0.5B-Instruct
 
 tasks:
   default:
@@ -57,15 +61,56 @@ tasks:
       - cmd: 'echo "Grafana: http://localhost:3000  Prometheus: http://localhost:9090  API: http://localhost:8080  fake vLLM: :8001-8003"'
         silent: true
 
+  stack:up:vllm-cpu:
+    desc: "Like stack:up, but with real vLLM on CPU (Phase 6b-CPU): one instance, ~6 min of warm-up"
+    cmds:
+      - docker compose -f {{.STACK_FILE}} -f {{.STACK_VLLM_CPU}} up -d --build
+      - cmd: 'echo "vLLM is warming up (~6 min); the platform registers it when ready (task stack:logs)"'
+        silent: true
+
+  stack:up:vllm-cpu:2:
+    desc: "Like stack:up:vllm-cpu, with two vLLM instances on separate cores (the benchmark)"
+    env:
+      VLLM_URLS: http://vllm-1:8000,http://vllm-2:8000
+    cmds:
+      - docker compose --profile two -f {{.STACK_FILE}} -f {{.STACK_VLLM_CPU}} up -d --build
+      - cmd: 'echo "Two vLLM instances warming up (~6-10 min); task stack:logs to follow"'
+        silent: true
+
   stack:down:
     desc: Stop and remove the observability stack, either variant (its data is not kept)
     cmds:
-      - docker compose -f {{.STACK_FILE}} down --remove-orphans
+      - docker compose --profile two -f {{.STACK_FILE}} -f {{.STACK_VLLM_CPU}} down --remove-orphans
 
   stack:logs:
     desc: Follow the platform's JSON logs in the stack
     cmds:
       - docker compose -f {{.STACK_FILE}} logs -f platform
+
+  # ---- real vLLM on CPU, standalone (Phase 6b-CPU) ----
+
+  vllm-cpu:up:
+    desc: "Start real vLLM on CPU on :8100 (pinned version; ~6 min warm-up, longer the first time)"
+    cmds:
+      - cmd: docker rm -f vllm-cpu
+        ignore_error: true
+      - docker run -d --name vllm-cpu -p 8100:8000 --shm-size 2g -v vllm-hf-cache:/root/.cache/huggingface -e VLLM_CPU_KVCACHE_SPACE=2 {{.VLLM_CPU_IMAGE}} {{.VLLM_CPU_MODEL}} --dtype float32 --max-model-len 4096
+      - cmd: 'echo "Warming up; ready when curl localhost:8100/health answers 200"'
+        silent: true
+
+  vllm-cpu:down:
+    desc: Stop and remove the standalone vLLM (the model cache volume is kept)
+    cmds:
+      - cmd: docker rm -f vllm-cpu
+        ignore_error: true
+
+  vllm-cpu:smoke:
+    desc: Smoke test of the adapter against the vLLM of vllm-cpu:up (TestRealVLLM)
+    dir: "{{.PLATFORM_DIR}}"
+    env:
+      VLLM_URL: http://localhost:8100
+    cmds:
+      - go test -count=1 -run TestRealVLLM -v ./internal/vllm
 
   # ---- testing suite ----
 

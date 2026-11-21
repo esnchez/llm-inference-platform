@@ -48,7 +48,7 @@ En una frase: **vLLM optimiza una GPU; la plataforma optimiza el clúster de GPU
 
 ## El `VLLMAdapter` (Fase 6a)
 
-**Implementado en la Fase 6a** (`internal/vllm`, decisiones en [13](13-fase-6a-decisiones.md)) y probado contra un vLLM falso; falta contrastarlo con un vLLM real (6b). Implementa `inference.Worker` sobre el ledger compartido:
+**Implementado en la Fase 6a** (`internal/vllm`, decisiones en [13](13-fase-6a-decisiones.md)) y **verificado contra vLLM 0.34 real en CPU** en la Fase 6b-CPU ([14](14-fase-6b-cpu-decisiones.md)): los formatos que suponía el falso (SSE, `usage`, errores, `/v1/models`, nombres de métricas) coinciden, y las respuestas reales están en `internal/vllm/testdata/vllm-0.34.0/` como *fixtures* de los tests. Diferencias encontradas y cómo quedaron: vLLM recorta `max_tokens` en vez de rechazar (la plataforma ahora hace lo mismo); en CPU el bloque de KV-Cache es de 128 tokens (el router no lo tiene en cuenta: limitación documentada); la *chat template* añade tokens que la estimación no cuenta (FI-3); y `request_success_total{finished_reason="abort"}` no cuenta las desconexiones del cliente. Implementa `inference.Worker` sobre el ledger compartido:
 
 ```mermaid
 sequenceDiagram

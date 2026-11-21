@@ -44,7 +44,7 @@ Las rutas usan los patrones con método de `net/http` (Go ≥ 1.22): un `GET` a 
 | :--- | :--- |
 | `model` | Obligatorio. Debe servirlo algún worker, si no `404`. |
 | `messages` | Obligatorio, no vacío. Cada mensaje con `role` y `content` **de texto** (un `content` en partes, multimodal, → `400`); `name` opcional. Se reenvían al motor tal cual y, aplanados, sirven para estimar tokens y para los hashes de prefijo. |
-| `max_completion_tokens` / `max_tokens` | Por este orden de preferencia; si no vienen, 256. Rango 1..`max-tokens-limit`. |
+| `max_completion_tokens` / `max_tokens` | Por este orden de preferencia; si no vienen, 256. Rango 1..`max-tokens-limit`. Con un motor real, si `prompt + max_tokens` supera su `max_model_len`, **se recorta `max_tokens`** a lo que cabe, como hace vLLM; solo un prompt que por sí solo no cabe da `400` (Fase 6b-CPU). |
 | `stream` | `true` → SSE. |
 | `stream_options.include_usage` | Añade un chunk final con `usage`. Con un motor real, `usage` lleva los tokens que contó el motor (FI-8); con el simulador, la estimación y los chunks. |
 | `n`, `best_of` (≠ 1), `logprobs` (`true`), `top_logprobs`, `prompt_logprobs`, `tools`, `tool_choice`, `functions`, `function_call` | **`400`** con la lista de campos y el motivo: la plataforma no sabría reservar capacidad para varias respuestas ni devolver logprobs o llamadas a herramientas (Fase 6a). `null` equivale a ausente. |

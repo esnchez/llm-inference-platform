@@ -243,6 +243,7 @@ type modelQueue struct {
 	serving    int
 	maxBudget  int // largest single worker budget: bigger never fits
 	tokenLimit int // QueueTokenFactor × total budget
+	maxContext int // largest context length its engines report (vLLM max_model_len); 0 if none does
 
 	queue        []*waiter
 	queuedTokens int
@@ -331,11 +332,34 @@ func (s *Scheduler) Close() {
 // After waiting: ErrQueueTimeout (also with Retry-After), or the context's
 // error when the client goes away.
 func (s *Scheduler) Acquire(ctx context.Context, req inference.InferenceRequest) (inference.Lease, error) {
+	req = s.clampToContext(req)
 	g, err := s.acquire(ctx, req, nil)
 	if err != nil {
 		return nil, err
 	}
 	return &managedLease{s: s, req: req, cur: g, queueWait: g.queueWait}, nil
+}
+
+// clampToContext does what vLLM does when prompt + max_tokens exceeds the
+// model's context length: it lowers max_tokens to what fits instead of
+// rejecting the request (Phase 6b-CPU, docs/servicio/14, decision 2). Only a
+// prompt that does not fit by itself is rejected (later, with a 400). The
+// limit is the context length real engines report; workers without one (the
+// simulator) keep the old behaviour. The prompt size is the estimate: if it
+// is low, vLLM clamps the rest itself.
+func (s *Scheduler) clampToContext(req inference.InferenceRequest) inference.InferenceRequest {
+	s.mu.Lock()
+	limit := 0
+	if m := s.byModel[req.Model]; m != nil {
+		limit = m.maxContext
+	}
+	s.mu.Unlock()
+	if limit > 0 && req.PromptTokens < limit && req.TokenCost() > limit {
+		s.cfg.Logger.Debug("max_tokens clamped to the context length", "request_id", req.ID,
+			"max_tokens", req.MaxNewTokens, "clamped_to", limit-req.PromptTokens, "context", limit)
+		req.MaxNewTokens = limit - req.PromptTokens
+	}
+	return req
 }
 
 // acquire is Acquire without the lease decorator; exclude lists workers a
